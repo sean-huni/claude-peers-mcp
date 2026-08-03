@@ -33,6 +33,7 @@ export interface RegisterRequest {
 
 export interface RegisterResponse {
   id: PeerId;
+  token: string;
 }
 
 export interface HeartbeatRequest {

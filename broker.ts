@@ -11,6 +11,7 @@
 
 import { Database } from "bun:sqlite";
 import { chmodSync } from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -57,7 +58,8 @@ db.run(`
     tty TEXT,
     summary TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
-    last_seen TEXT NOT NULL
+    last_seen TEXT NOT NULL,
+    token TEXT
   )
 `);
 
@@ -73,6 +75,15 @@ db.run(`
     FOREIGN KEY (to_id) REFERENCES peers(id)
   )
 `);
+
+// Add columns an older database predates. Every column the insert below writes
+// must appear here, or the broker crashes at boot against a legacy file.
+{
+  const existing = new Set(
+    (db.query("PRAGMA table_info(peers)").all() as { name: string }[]).map((c) => c.name)
+  );
+  if (!existing.has("token")) db.run("ALTER TABLE peers ADD COLUMN token TEXT");
+}
 
 // Clean up stale peers (PIDs that no longer exist) on startup
 function cleanStalePeers() {
@@ -98,8 +109,12 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, token)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const selectToken = db.prepare(`
+  SELECT token FROM peers WHERE id = ?
 `);
 
 const updateLastSeen = db.prepare(`
@@ -179,8 +194,9 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
-  return { id };
+  const token = randomBytes(32).toString("hex");
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now, token);
+  return { id, token };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
@@ -267,6 +283,48 @@ function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
 
+// --- Authentication ---
+
+/**
+ * Which body field names the calling peer, per route. The handler then trusts
+ * the authenticated identity rather than the body, so a caller cannot act as
+ * another peer by naming it.
+ */
+const CALLER_FIELD: Record<string, string> = {
+  "/heartbeat": "id",
+  "/set-summary": "id",
+  "/list-peers": "exclude_id",
+  "/send-message": "from_id",
+  "/poll-messages": "id",
+  "/ack-messages": "peer_id",
+  "/unregister": "id",
+};
+
+/**
+ * Verify the bearer token against the peer the body claims to be.
+ *
+ * Peer ids are public via /list-peers, so the id alone proves nothing. The
+ * token is 256 bits minted at registration and never leaves the owning process.
+ */
+function isAuthorized(req: Request, path: string, body: Record<string, unknown>): boolean {
+  const field = CALLER_FIELD[path];
+  if (!field) return true;
+
+  const claimed = body[field];
+  // /list-peers may omit exclude_id; an anonymous read is still a read of every
+  // session's cwd and summary, so it is refused rather than allowed through.
+  if (typeof claimed !== "string" || claimed.length === 0) return false;
+
+  const row = selectToken.get(claimed) as { token: string | null } | null;
+  if (!row?.token) return false;
+
+  const presented = (req.headers.get("authorization") ?? "").replace(/^Bearer /, "");
+  const a = Buffer.from(presented);
+  const b = Buffer.from(row.token);
+  // timingSafeEqual throws on a length mismatch, which is itself the answer.
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 // --- HTTP Server ---
 
 Bun.serve({
@@ -285,6 +343,10 @@ Bun.serve({
 
     try {
       const body = await req.json();
+
+      if (!isAuthorized(req, path, body as Record<string, unknown>)) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
 
       switch (path) {
         case "/register":

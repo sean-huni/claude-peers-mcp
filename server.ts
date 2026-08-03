@@ -45,7 +45,10 @@ const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(myToken ? { Authorization: `Bearer ${myToken}` } : {}),
+    },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -136,6 +139,8 @@ function getTty(): string | null {
 // --- State ---
 
 let myId: PeerId | null = null;
+// Minted by the broker at registration; proves this process owns myId.
+let myToken: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
@@ -436,6 +441,7 @@ async function pollAndPushMessages() {
           scope: "machine",
           cwd: myCwd,
           git_root: myGitRoot,
+          exclude_id: myId,
         });
         const sender = peers.find((p) => p.id === msg.from_id);
         if (sender) {
@@ -522,6 +528,7 @@ async function main() {
     summary: initialSummary,
   });
   myId = reg.id;
+  myToken = reg.token;
   log(`Registered as peer ${myId}`);
 
   // If summary generation is still running, update it when done

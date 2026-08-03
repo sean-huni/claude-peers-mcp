@@ -18,17 +18,40 @@ const BASE = `http://127.0.0.1:${PORT}`;
 
 let broker: ReturnType<typeof Bun.spawn>;
 
-function post<T>(path: string, body: unknown): Promise<T> {
+function post<T>(path: string, body: unknown, token?: string): Promise<T> {
   return fetch(`${BASE}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify(body),
   }).then((r) => r.json() as Promise<T>);
 }
 
+function rawPost(path: string, body: unknown, token?: string) {
+  return fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+// The broker evicts any prior peer sharing a pid, so each test peer needs its
+// own live process. Real pids matter: peers whose process is gone get reaped.
+const holders: ReturnType<typeof Bun.spawn>[] = [];
+function livePid(): number {
+  const p = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+  holders.push(p);
+  return p.pid;
+}
+
 function register(cwd: string, gitRoot: string | null = null) {
-  return post<{ id: string }>("/register", {
-    pid: process.pid,
+  return post<{ id: string; token: string }>("/register", {
+    pid: livePid(),
     cwd,
     git_root: gitRoot,
     tty: null,
@@ -37,9 +60,10 @@ function register(cwd: string, gitRoot: string | null = null) {
 }
 
 type Msg = { id: number; from_id: string; to_id: string; text: string; sent_at: string };
-const poll = (id: string) => post<{ messages: Msg[] }>("/poll-messages", { id });
-const ack = (peer_id: string, message_ids: number[]) =>
-  post<{ ok: boolean; acked: number }>("/ack-messages", { peer_id, message_ids });
+const poll = (id: string, token: string) =>
+  post<{ messages: Msg[] }>("/poll-messages", { id }, token);
+const ack = (peer_id: string, message_ids: number[], token: string) =>
+  post<{ ok: boolean; acked: number }>("/ack-messages", { peer_id, message_ids }, token);
 
 beforeAll(async () => {
   for (const suffix of ["", "-wal", "-shm"]) rmSync(`${DB}${suffix}`, { force: true });
@@ -62,6 +86,7 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
+  for (const h of holders) h.kill();
   broker?.kill();
   for (const suffix of ["", "-wal", "-shm"]) rmSync(`${DB}${suffix}`, { force: true });
 });
@@ -75,7 +100,7 @@ test("a registered peer is discoverable and excludes itself", async () => {
     cwd: "/tmp/peer-a",
     git_root: null,
     exclude_id: a.id,
-  });
+  }, a.token);
 
   const ids = seen.map((p) => p.id);
   expect(ids).toContain(b.id);
@@ -88,7 +113,7 @@ test("a message sent to an unknown peer is refused", async () => {
     from_id: a.id,
     to_id: "nosuchpeer",
     text: "hello",
-  });
+  }, a.token);
   expect(res.ok).toBe(false);
   expect(res.error).toContain("not found");
 });
@@ -97,11 +122,11 @@ test("polling does NOT consume the message", async () => {
   // Regression guard. Upstream marked messages delivered inside /poll-messages,
   // so a message was destroyed even when the client failed to render it.
   const a = await register("/tmp/poll-a");
-  await post("/send-message", { from_id: a.id, to_id: a.id, text: "survives polling" });
+  await post("/send-message", { from_id: a.id, to_id: a.id, text: "survives polling" }, a.token);
 
-  const first = await poll(a.id);
-  const second = await poll(a.id);
-  const third = await poll(a.id);
+  const first = await poll(a.id, a.token);
+  const second = await poll(a.id, a.token);
+  const third = await poll(a.id, a.token);
 
   expect(first.messages).toHaveLength(1);
   expect(second.messages).toHaveLength(1);
@@ -111,12 +136,12 @@ test("polling does NOT consume the message", async () => {
 
 test("acknowledging deletes the row rather than flagging it", async () => {
   const a = await register("/tmp/ack-a");
-  await post("/send-message", { from_id: a.id, to_id: a.id, text: "delete me" });
-  const [msg] = (await poll(a.id)).messages;
+  await post("/send-message", { from_id: a.id, to_id: a.id, text: "delete me" }, a.token);
+  const [msg] = (await poll(a.id, a.token)).messages;
 
-  const res = await ack(a.id, [msg!.id]);
+  const res = await ack(a.id, [msg!.id], a.token);
   expect(res).toEqual({ ok: true, acked: 1 });
-  expect((await poll(a.id)).messages).toHaveLength(0);
+  expect((await poll(a.id, a.token)).messages).toHaveLength(0);
 
   // Retention matters as much as delivery: the text must be gone from the
   // file, not merely hidden behind a delivered flag.
@@ -128,43 +153,43 @@ test("acknowledging deletes the row rather than flagging it", async () => {
 
 test("acknowledging is idempotent and ignores unknown ids", async () => {
   const a = await register("/tmp/ack-idem");
-  await post("/send-message", { from_id: a.id, to_id: a.id, text: "once" });
-  const [msg] = (await poll(a.id)).messages;
+  await post("/send-message", { from_id: a.id, to_id: a.id, text: "once" }, a.token);
+  const [msg] = (await poll(a.id, a.token)).messages;
 
-  expect((await ack(a.id, [msg!.id])).acked).toBe(1);
-  expect((await ack(a.id, [msg!.id])).acked).toBe(0);
-  expect((await ack(a.id, [999_999])).acked).toBe(0);
+  expect((await ack(a.id, [msg!.id], a.token)).acked).toBe(1);
+  expect((await ack(a.id, [msg!.id], a.token)).acked).toBe(0);
+  expect((await ack(a.id, [999_999], a.token)).acked).toBe(0);
 });
 
 test("a client loop renders each message exactly once", async () => {
   // Models what server.ts does. Without the in-process id set, a non-consuming
   // poll re-pushes the same message on every one second cycle, forever.
   const a = await register("/tmp/loop-a");
-  await post("/send-message", { from_id: a.id, to_id: a.id, text: "render once" });
+  await post("/send-message", { from_id: a.id, to_id: a.id, text: "render once" }, a.token);
 
   const pushed = new Set<number>();
   let renders = 0;
   for (let cycle = 0; cycle < 3; cycle++) {
-    for (const m of (await poll(a.id)).messages) {
+    for (const m of (await poll(a.id, a.token)).messages) {
       if (pushed.has(m.id)) continue;
       renders++;
       pushed.add(m.id);
-      await ack(a.id, [m.id]);
+      await ack(a.id, [m.id], a.token);
     }
   }
 
   expect(renders).toBe(1);
-  expect((await poll(a.id)).messages).toHaveLength(0);
+  expect((await poll(a.id, a.token)).messages).toHaveLength(0);
 });
 
 test("messages are delivered in the order they were sent", async () => {
   const a = await register("/tmp/order-a");
   for (const text of ["first", "second", "third"]) {
-    await post("/send-message", { from_id: a.id, to_id: a.id, text });
+    await post("/send-message", { from_id: a.id, to_id: a.id, text }, a.token);
     await Bun.sleep(5); // sent_at has millisecond resolution
   }
 
-  const texts = (await poll(a.id)).messages.map((m) => m.text);
+  const texts = (await poll(a.id, a.token)).messages.map((m) => m.text);
   expect(texts).toEqual(["first", "second", "third"]);
 });
 
@@ -174,17 +199,37 @@ test("the database file is not readable by other accounts", async () => {
   expect(mode & 0o077).toBe(0);
 });
 
-test("KNOWN GAP: any caller can acknowledge another peer's mail", async () => {
-  // Documents a real hole rather than asserting the behaviour is correct.
-  // peer_id is supplied by the caller and peer ids are public via /list-peers,
-  // so a stray local process can delete a session's queued messages. Closing
-  // this needs request authentication, which the broker does not yet have.
-  // When auth lands, this test should flip to expecting acked === 0.
+test("a caller cannot act as another peer without its token", async () => {
+  // Peer ids are public via /list-peers, so the id alone must prove nothing.
+  // This previously succeeded: any local process could delete a session's
+  // queued mail simply by naming it.
   const victim = await register("/tmp/victim");
-  await post("/send-message", { from_id: victim.id, to_id: victim.id, text: "private" });
-  const [msg] = (await poll(victim.id)).messages;
+  await post("/send-message", { from_id: victim.id, to_id: victim.id, text: "private" }, victim.token);
+  const [msg] = (await poll(victim.id, victim.token)).messages;
 
-  const stolen = await ack(victim.id, [msg!.id]); // caller simply claims the id
-  expect(stolen.acked).toBe(1);
-  expect((await poll(victim.id)).messages).toHaveLength(0);
+  // No token at all.
+  expect((await rawPost("/ack-messages", { peer_id: victim.id, message_ids: [msg!.id] })).status).toBe(401);
+
+  // A valid token, but belonging to a different peer.
+  const other = await register("/tmp/other");
+  expect(
+    (await rawPost("/ack-messages", { peer_id: victim.id, message_ids: [msg!.id] }, other.token)).status
+  ).toBe(401);
+
+  // Reading and injecting are refused on the same basis.
+  expect((await rawPost("/poll-messages", { id: victim.id })).status).toBe(401);
+  expect((await rawPost("/list-peers", { scope: "machine", cwd: "/tmp", git_root: null })).status).toBe(401);
+  expect(
+    (await rawPost("/send-message", { from_id: victim.id, to_id: victim.id, text: "forged" })).status
+  ).toBe(401);
+
+  // The victim's mail survived every attempt.
+  expect((await poll(victim.id, victim.token)).messages).toHaveLength(1);
+});
+
+test("registration mints a high entropy token", async () => {
+  const a = await register("/tmp/entropy");
+  expect(a.token).toMatch(/^[0-9a-f]{64}$/); // 256 bits, hex
+  const b = await register("/tmp/entropy-2");
+  expect(b.token).not.toBe(a.token);
 });

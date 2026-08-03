@@ -30,6 +30,9 @@ import type {
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
 const MSG_TTL_MS = parseInt(process.env.CLAUDE_PEERS_MSG_TTL ?? "3600000", 10);
+// How long after a delete the write-ahead log is checkpointed away. See
+// scheduleCheckpoint below for why this is a debounce rather than immediate.
+const CHECKPOINT_MS = parseInt(process.env.CLAUDE_PEERS_CHECKPOINT_MS ?? "1000", 10);
 
 // --- Database setup ---
 
@@ -88,6 +91,65 @@ db.run(`
   if (!existing.has("token")) db.run("ALTER TABLE peers ADD COLUMN token TEXT");
 }
 
+// --- Retention: getting deleted text off the disk ---
+
+/**
+ * Checkpoint the write-ahead log so a delete is actually a delete.
+ *
+ * secure_delete zeroes freed pages in the MAIN database file, but in WAL mode
+ * the page images written when the message was inserted already sit in the
+ * -wal, where nothing rewrites them. The broker is killed rather than closed,
+ * so no implicit checkpoint ever runs and the plaintext of every acknowledged
+ * message stays readable in that file for the life of the database. Verified
+ * before this fix: the canary was absent from the .db and present in the -wal,
+ * and survived SIGTERM in a 45 KB file.
+ *
+ * TRUNCATE rather than PASSIVE or FULL: PASSIVE and FULL copy the frames back
+ * into the database but leave the -wal file at its high water mark, with the
+ * stale frames still legible in it. TRUNCATE takes the file to zero length,
+ * which is the only variant that removes the bytes.
+ *
+ * Alternatives weighed:
+ *   - journal_mode = DELETE or TRUNCATE. This trades away WAL's concurrent
+ *     readers for a rollback journal that carries the same original page
+ *     images, deleted rather than zeroed at commit. It costs concurrency
+ *     without actually being safer.
+ *   - Checkpointing inside every delete. Correct but wasteful: an ack of ten
+ *     messages would pay ten checkpoints, and the sweep would pay one per
+ *     expired row, all for the same handful of pages.
+ *   - Checkpointing only at a clean shutdown. Worthless here, because the
+ *     broker is normally killed, which is exactly how the defect survived.
+ * So: debounce. A delete schedules a checkpoint CHECKPOINT_MS later, and a
+ * burst of deletes collapses into one. The contract is that deleted text is
+ * gone from every file on disk within CHECKPOINT_MS of the last delete, one
+ * second by default.
+ */
+function checkpointNow(): void {
+  try {
+    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  } catch {
+    // A reader can hold the checkpoint off. The next delete reschedules it, and
+    // the shutdown path retries, so a missed cycle is not a leak.
+  }
+}
+
+let checkpointTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleCheckpoint(): void {
+  if (checkpointTimer) return;
+  checkpointTimer = setTimeout(() => {
+    checkpointTimer = null;
+    checkpointNow();
+  }, CHECKPOINT_MS);
+  // Never hold the process open for a checkpoint; the shutdown path runs one.
+  checkpointTimer.unref?.();
+}
+
+/** Called by every path that deletes rows carrying message text. */
+function noteDeletion(changes: number): void {
+  if (changes > 0) scheduleCheckpoint();
+}
+
 /**
  * Whether a pid belongs to a running process.
  *
@@ -110,6 +172,8 @@ function cleanStalePeers() {
     if (!isProcessAlive(peer.pid)) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ?", [peer.id]);
+      // Their undelivered mail is now freed pages; get it off the disk.
+      noteDeletion(1);
     }
   }
 }
@@ -284,16 +348,20 @@ function handleAckMessages(body: AckMessagesRequest): AckMessagesResponse {
   for (const id of body.message_ids) {
     acked += ackMessage.run(id, body.peer_id).changes;
   }
+  // A burst of acks collapses into one checkpoint rather than one each.
+  noteDeletion(acked);
   return { ok: true, acked };
 }
 
 function sweepExpiredMessages(): void {
   const cutoff = new Date(Date.now() - MSG_TTL_MS).toISOString();
-  sweepExpired.run(cutoff);
+  // Expired mail was never acknowledged, so this is the only thing that takes
+  // it off the disk.
+  noteDeletion(sweepExpired.run(cutoff).changes);
 }
 
 function handleUnregister(body: { id: string }): void {
-  deletePeer.run(body.id);
+  noteDeletion(deletePeer.run(body.id).changes);
 }
 
 // --- Authentication ---
@@ -390,5 +458,37 @@ Bun.serve({
     }
   },
 });
+
+// --- Shutdown ---
+
+/**
+ * Close the database rather than letting the process be torn down around it.
+ *
+ * The broker is normally killed, not stopped, so this is the common path and
+ * not an edge case. A pending debounced checkpoint is run first: a signal that
+ * arrives inside the debounce window must not be the thing that leaves the
+ * deleted text on disk. Closing then removes the -wal and -shm entirely.
+ */
+let shuttingDown = false;
+
+function shutdown(): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (checkpointTimer) {
+    clearTimeout(checkpointTimer);
+    checkpointTimer = null;
+  }
+  checkpointNow();
+  try {
+    db.close();
+  } catch {
+    // Already closed, or closed under us. Nothing left to protect.
+  }
+  process.exit(0);
+}
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+process.on("SIGHUP", shutdown);
 
 console.error(`[claude-peers broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);

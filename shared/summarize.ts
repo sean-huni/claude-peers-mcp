@@ -2,10 +2,60 @@
  * Generate a 1-2 sentence summary of what a Claude Code instance is likely
  * working on, based on its working directory and git context.
  *
- * Uses OpenAI's gpt-5.4-nano for cheap, fast inference.
- * Requires OPENAI_API_KEY environment variable.
- * Falls back gracefully if unavailable.
+ * Uses Claude via the Anthropic API. Credentials resolve in this order:
+ *   1. ANTHROPIC_API_KEY  — a Console API key, billed per token.
+ *   2. The local Claude Code OAuth token from the macOS Keychain.
+ *
+ * Falls back gracefully (returns null) if neither is available.
  */
+
+import Anthropic from "@anthropic-ai/sdk";
+
+type Auth =
+  | { kind: "apiKey"; value: string }
+  | { kind: "oauth"; value: string };
+
+/**
+ * Read the Claude Code OAuth access token from the macOS Keychain.
+ *
+ * Read fresh on every call, never cached: the access token is short-lived
+ * (hours) and Claude Code rotates it in place, so a cached copy goes stale.
+ */
+async function readKeychainToken(): Promise<string | null> {
+  if (process.platform !== "darwin") return null;
+  try {
+    const proc = Bun.spawn(
+      ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      { stdout: "pipe", stderr: "ignore" }
+    );
+    const text = await new Response(proc.stdout).text();
+    if ((await proc.exited) !== 0) return null;
+
+    const creds = JSON.parse(text) as {
+      claudeAiOauth?: { accessToken?: string; expiresAt?: number };
+    };
+    const oauth = creds.claudeAiOauth;
+    if (!oauth?.accessToken) return null;
+    if (oauth.expiresAt && oauth.expiresAt <= Date.now()) return null;
+    return oauth.accessToken;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveAuth(): Promise<Auth | null> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (apiKey) return { kind: "apiKey", value: apiKey };
+
+  const token = await readKeychainToken();
+  return token ? { kind: "oauth", value: token } : null;
+}
+
+const SYSTEM_PROMPT =
+  "You generate brief summaries of what a developer is working on based on " +
+  "their project context. Respond with exactly 1-2 sentences, no more. Be " +
+  "specific about the project name and likely task. Respond with the summary " +
+  "only, with no preamble.";
 
 export async function generateSummary(context: {
   cwd: string;
@@ -13,8 +63,8 @@ export async function generateSummary(context: {
   git_branch?: string | null;
   recent_files?: string[];
 }): Promise<string | null> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
+  const auth = await resolveAuth();
+  if (!auth) {
     return null;
   }
 
@@ -30,39 +80,44 @@ export async function generateSummary(context: {
   }
 
   try {
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-5.4-nano",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You generate brief summaries of what a developer is working on based on their project context. Respond with exactly 1-2 sentences, no more. Be specific about the project name and likely task.",
-          },
-          {
-            role: "user",
-            content: `Based on this context, what is this developer likely working on?\n\n${parts.join("\n")}`,
-          },
-        ],
-        max_tokens: 100,
-        temperature: 0.3,
-      }),
-      signal: AbortSignal.timeout(5000),
+    const client = new Anthropic({
+      timeout: 15_000,
+      maxRetries: 1,
+      ...(auth.kind === "apiKey"
+        ? { apiKey: auth.value }
+        : {
+            apiKey: null,
+            authToken: auth.value,
+            defaultHeaders: { "anthropic-beta": "oauth-2025-04-20" },
+          }),
     });
 
-    if (!res.ok) {
+    // Haiku deliberately: it is the fast/cheap tier this one-line summary
+    // needs, and it is the only tier the Claude Code OAuth token can reach
+    // (Opus returns 429 rate_limit_error on a subscription credential).
+    const message = await client.messages.create({
+      model: "claude-haiku-4-5",
+      max_tokens: 300,
+      system: SYSTEM_PROMPT,
+      messages: [
+        {
+          role: "user",
+          content: `Based on this context, what is this developer likely working on?\n\n${parts.join("\n")}`,
+        },
+      ],
+    });
+
+    if (message.stop_reason === "refusal") {
       return null;
     }
 
-    const data = (await res.json()) as {
-      choices: Array<{ message: { content: string } }>;
-    };
-    return data.choices[0]?.message?.content?.trim() ?? null;
+    const text = message.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("")
+      .trim();
+
+    return text.length > 0 ? text : null;
   } catch {
     return null;
   }

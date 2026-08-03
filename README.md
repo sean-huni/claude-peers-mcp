@@ -88,7 +88,14 @@ The broker auto-launches when the first session starts. It cleans up dead peers 
 
 ## Auto-summary
 
-If you set `OPENAI_API_KEY` in your environment, each instance generates a brief summary on startup using `gpt-5.4-nano` (costs fractions of a cent). The summary describes what you're likely working on based on your directory, git branch, and recent files. Other instances see this when they call `list_peers`.
+Each instance generates a brief summary on startup using Claude Haiku. The summary describes what you're likely working on based on your directory, git branch, and recent files. Other instances see this when they call `list_peers`.
+
+Credentials resolve in this order:
+
+1. `ANTHROPIC_API_KEY` if set: a Console API key, billed per token.
+2. Otherwise, on macOS, the local Claude Code OAuth token read from the Keychain (`Claude Code-credentials`). No configuration needed if you are signed in to Claude Code.
+
+The Keychain token is read fresh on every call, never cached, because Claude Code rotates it every few hours. If neither credential is available, the summary is skipped and Claude sets its own via the `set_summary` tool.
 
 Without the API key, Claude sets its own summary via the `set_summary` tool.
 
@@ -111,7 +118,7 @@ bun cli.ts kill-broker       # stop the broker
 | -------------------- | -------------------- | ------------------------------------- |
 | `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
 | `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
-| `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
+| `ANTHROPIC_API_KEY`  | Keychain OAuth token | Auto-summary credential (optional)    |
 
 ## Requirements
 

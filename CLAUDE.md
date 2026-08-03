@@ -13,7 +13,7 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 - `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
 - `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
 - `shared/types.ts` — Shared TypeScript types for broker API.
-- `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
+- `shared/summarize.ts` — Auto-summary via Claude Haiku (Anthropic SDK). Credential resolves ANTHROPIC_API_KEY first, then the Claude Code OAuth token from the macOS Keychain (re-read per call; it rotates hourly).
 - `cli.ts` — CLI utility for inspecting broker state.
 
 ## Running

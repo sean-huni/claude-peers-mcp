@@ -236,6 +236,17 @@ bun cli.ts kill-broker       # stop the broker
 | `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
 | `ANTHROPIC_API_KEY`  | Keychain OAuth token | Auto-summary credential (optional)    |
 
+
+## Quicker Launch
+
+The sequence after dev is confirmed
+
+execute: `cd /Users/sean/env/repo/ai/claude-peers-mcp`
+execute: `bun install`
+execute: `lsof -ti :7899 -sTCP:LISTEN | xargs kill        # broker outlives sessions; must die`
+
+Then exit and relaunch each Claude Code session
+
 ## Requirements
 
 - [Bun](https://bun.sh)

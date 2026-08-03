@@ -26,6 +26,7 @@ import type {
   PollMessagesResponse,
   Message,
 } from "./shared/types.ts";
+import pkg from "./package.json";
 import {
   generateSummary,
   getGitBranch,
@@ -39,6 +40,9 @@ const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+// Sourced from package.json so the version reported to MCP clients cannot
+// drift from the released one.
+const VERSION = (pkg as { version: string }).version;
 
 // --- Broker communication ---
 
@@ -147,7 +151,7 @@ let myGitRoot: string | null = null;
 // --- MCP Server ---
 
 const mcp = new Server(
-  { name: "claude-peers", version: "0.1.0" },
+  { name: "claude-peers", version: VERSION },
   {
     capabilities: {
       experimental: { "claude/channel": {} },

@@ -70,7 +70,7 @@ The other Claude receives it immediately and responds.
 
 ## How it works
 
-A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker and polls for messages every second. Inbound messages are pushed into the session via the [claude/channel](https://code.claude.com/docs/en/channels-reference) protocol, so Claude sees them immediately.
+A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker and subscribes to it. Both hops push: the broker writes a `text/event-stream` frame the moment a message lands in a peer's mailbox, and the MCP server passes it into the session via the [claude/channel](https://code.claude.com/docs/en/channels-reference) protocol, so Claude sees it immediately.
 
 ```
                     ┌───────────────────────────┐
@@ -85,6 +85,35 @@ A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude
 ```
 
 The broker auto-launches when the first session starts. It cleans up dead peers automatically. Everything is localhost-only.
+
+### The push transport, and the poll behind it
+
+`GET /subscribe?id=<peer>` with the peer's bearer token opens an event stream. The broker notifies
+at the point a row is inserted into `messages`, so every route that queues mail wakes its recipient
+without having to remember to. The frame says only that there is something to fetch: the client
+then runs the same delivery the poll runs, which is what makes it impossible for a message to be
+rendered twice by two transports.
+
+The poll is still there. While the stream is healthy it runs every 30 seconds as an audit rather
+than as the transport; the moment the stream is gone it returns to one second, which is exactly
+what the session did before. A broker that does not serve `/subscribe` at all, an older one or one
+started with `CLAUDE_PEERS_SSE=off`, is therefore not a broker a session goes deaf against, only a
+slower one.
+
+| Variable                       | Default | What it changes                                        |
+| ------------------------------ | ------- | ------------------------------------------------------ |
+| `CLAUDE_PEERS_SSE`             | `on`    | Broker: `off` makes `/subscribe` a 404                 |
+| `CLAUDE_PEERS_STREAM`          | `on`    | Server: `off` disables subscribing, polling only       |
+| `CLAUDE_PEERS_POLL_MS`         | `1000`  | Poll interval while there is no healthy stream         |
+| `CLAUDE_PEERS_POLL_IDLE_MS`    | `30000` | Poll interval while the stream is healthy              |
+| `CLAUDE_PEERS_SSE_KEEPALIVE_MS`| `25000` | Broker: comment frames down an idle stream             |
+| `CLAUDE_PEERS_STREAM_IDLE_MS`  | `75000` | Server: silence after which a stream is presumed dead  |
+
+Measure it on your own machine with the harness, which runs unmodified against any checkout:
+
+```bash
+bun bench/send-to-render.ts --root . --port 7840 --n 30 --label after
+```
 
 ## Auto-summary
 

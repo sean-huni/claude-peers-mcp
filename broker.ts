@@ -10,6 +10,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { chmodSync } from "node:fs";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -21,16 +22,31 @@ import type {
   PollMessagesResponse,
   Peer,
   Message,
+  AckMessagesRequest,
+  AckMessagesResponse,
 } from "./shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const MSG_TTL_MS = parseInt(process.env.CLAUDE_PEERS_MSG_TTL ?? "3600000", 10);
 
 // --- Database setup ---
 
 const db = new Database(DB_PATH);
 db.run("PRAGMA journal_mode = WAL");
 db.run("PRAGMA busy_timeout = 3000");
+// Zero freed pages rather than leaving message text recoverable in the freelist.
+db.run("PRAGMA secure_delete = ON");
+
+// The database holds every inter-agent message. Default file creation is 0644,
+// which leaves it readable by any account on the machine.
+for (const suffix of ["", "-wal", "-shm"]) {
+  try {
+    chmodSync(`${DB_PATH}${suffix}`, 0o600);
+  } catch {
+    // -wal/-shm may not exist yet; they are re-chmodded on the next boot.
+  }
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS peers (
@@ -68,7 +84,7 @@ function cleanStalePeers() {
     } catch {
       // Process doesn't exist, remove it
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+      db.run("DELETE FROM messages WHERE to_id = ?", [peer.id]);
     }
   }
 }
@@ -77,6 +93,7 @@ cleanStalePeers();
 
 // Periodically clean stale peers (every 30s)
 setInterval(cleanStalePeers, 30_000);
+
 
 // --- Prepared statements ---
 
@@ -118,9 +135,21 @@ const selectUndelivered = db.prepare(`
   SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
 `);
 
-const markDelivered = db.prepare(`
-  UPDATE messages SET delivered = 1 WHERE id = ?
+// Acknowledgement deletes rather than flagging: a delivered message has no
+// further use, and retaining it leaves plaintext in the file indefinitely.
+// Scoped to the caller's own mailbox so a peer cannot ack another peer's mail.
+const ackMessage = db.prepare(`
+  DELETE FROM messages WHERE id = ? AND to_id = ?
 `);
+
+// Undelivered mail is swept once its TTL expires, otherwise rows now accumulate
+// forever: polling no longer consumes them.
+const sweepExpired = db.prepare(`
+  DELETE FROM messages WHERE sent_at < ?
+`);
+
+sweepExpiredMessages();
+setInterval(sweepExpiredMessages, 60_000);
 
 // --- Generate peer ID ---
 
@@ -209,14 +238,24 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
+  // Polling deliberately does NOT consume. Upstream marked messages delivered
+  // here, so a message was lost outright whenever the client polled but failed
+  // to render it. The client now acks once it has actually shown the message.
   const messages = selectUndelivered.all(body.id) as Message[];
-
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
-  }
-
   return { messages };
+}
+
+function handleAckMessages(body: AckMessagesRequest): AckMessagesResponse {
+  let acked = 0;
+  for (const id of body.message_ids) {
+    acked += ackMessage.run(id, body.peer_id).changes;
+  }
+  return { ok: true, acked };
+}
+
+function sweepExpiredMessages(): void {
+  const cutoff = new Date(Date.now() - MSG_TTL_MS).toISOString();
+  sweepExpired.run(cutoff);
 }
 
 function handleUnregister(body: { id: string }): void {
@@ -257,6 +296,8 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/ack-messages":
+          return Response.json(handleAckMessages(body as AckMessagesRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });

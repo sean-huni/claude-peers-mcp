@@ -29,6 +29,7 @@ import type {
 import { fileURLToPath } from "node:url";
 import pkg from "./package.json";
 import { drainSpool, findSessionPid, spoolMessage, sweepDeadSpools } from "./spool";
+import { PollBackoff } from "./poll-backoff.ts";
 import {
   generateSummary,
   getGitBranch,
@@ -41,6 +42,13 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
+// A broker that is down must not cost a log line per poll. Config from the
+// environment so an operator can tune the noise without a rebuild.
+const POLL_BACKOFF_MAX_MS = parseInt(
+  process.env.CLAUDE_PEERS_POLL_BACKOFF_MAX_MS ?? "60000",
+  10
+);
+const POLL_QUIET_MS = parseInt(process.env.CLAUDE_PEERS_POLL_QUIET_MS ?? "300000", 10);
 // fileURLToPath, not .pathname: the latter is percent-encoded, so any install
 // directory containing a space yields a module-not-found at broker launch.
 const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
@@ -599,15 +607,36 @@ function clientRendersChannel(): boolean {
  */
 const sessionPid: number | null = findSessionPid();
 
+/**
+ * Retry schedule and log rate limiting for the loop below.
+ *
+ * The timer still fires every second, because that is the latency a reachable
+ * broker deserves. When the broker is unreachable this holds the loop off on a
+ * growing interval and suppresses the repeat log lines, which otherwise filled
+ * the session's MCP log file at one line a second for as long as the outage
+ * lasted.
+ */
+const pollBackoff = new PollBackoff({
+  baseDelayMs: POLL_INTERVAL_MS,
+  maxDelayMs: POLL_BACKOFF_MAX_MS,
+  quietMs: POLL_QUIET_MS,
+});
+
 async function pollAndPushMessages() {
   if (!myId) return;
   // Without a channel AND without a resolvable session there is nowhere to deliver, so the message
   // stays queued for check_messages. That is the only remaining case where a message waits to be
   // asked for.
   if (!clientRendersChannel() && sessionPid === null) return;
+  // Serving out a backoff window from an earlier failure.
+  if (!pollBackoff.ready(Date.now())) return;
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    // Reached the broker, so an outage that was reported earlier is now over.
+    // Said once, then the loop goes quiet again.
+    const recovered = pollBackoff.noteSuccess(Date.now());
+    if (recovered) log(recovered);
     const fresh = result.messages.filter((m) => !pushedMessageIds.has(m.id));
 
     for (const msg of fresh) {
@@ -669,8 +698,14 @@ async function pollAndPushMessages() {
       await ackMessages([msg.id]);
     }
   } catch (e) {
-    // Broker might be down temporarily, don't crash
-    log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+    // Broker might be down temporarily, don't crash. The failure also backs the
+    // loop off and rate limits this line: an unreachable broker used to write
+    // one line a second into the session's MCP log file, indefinitely. It is
+    // still reported the first time, on any change of error, and periodically
+    // for as long as it lasts, because a session that cannot reach its broker
+    // is broken and silence would hide that.
+    const line = pollBackoff.noteFailure(e instanceof Error ? e.message : String(e), Date.now());
+    if (line) log(line);
   }
 }
 

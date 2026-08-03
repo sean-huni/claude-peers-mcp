@@ -33,6 +33,7 @@ export interface RegisterRequest {
 
 export interface RegisterResponse {
   id: PeerId;
+  token: string;
 }
 
 export interface HeartbeatRequest {
@@ -64,4 +65,14 @@ export interface PollMessagesRequest {
 
 export interface PollMessagesResponse {
   messages: Message[];
+}
+
+export interface AckMessagesRequest {
+  peer_id: string;
+  message_ids: number[];
+}
+
+export interface AckMessagesResponse {
+  ok: boolean;
+  acked: number;
 }

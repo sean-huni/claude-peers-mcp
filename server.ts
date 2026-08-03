@@ -45,7 +45,10 @@ const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(myToken ? { Authorization: `Bearer ${myToken}` } : {}),
+    },
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -136,6 +139,8 @@ function getTty(): string | null {
 // --- State ---
 
 let myId: PeerId | null = null;
+// Minted by the broker at registration; proves this process owns myId.
+let myToken: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
@@ -401,13 +406,33 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // --- Polling loop for inbound messages ---
 
+// Messages already pushed this process lifetime. The broker no longer consumes
+// on poll, so without this the same message is re-pushed on every 1s cycle.
+const pushedMessageIds = new Set<number>();
+
+/**
+ * Acknowledge messages, which deletes them broker-side.
+ *
+ * Only called once a message has actually been rendered to the user, so a
+ * message is never destroyed by the mere act of polling for it.
+ */
+async function ackMessages(ids: number[]): Promise<void> {
+  if (!myId || ids.length === 0) return;
+  try {
+    await brokerFetch("/ack-messages", { peer_id: myId, message_ids: ids });
+  } catch {
+    // Leaving it unacked is safe: it stays queued and is retried next cycle.
+  }
+}
+
 async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    const fresh = result.messages.filter((m) => !pushedMessageIds.has(m.id));
 
-    for (const msg of result.messages) {
+    for (const msg of fresh) {
       // Look up the sender's info for context
       let fromSummary = "";
       let fromCwd = "";
@@ -416,6 +441,7 @@ async function pollAndPushMessages() {
           scope: "machine",
           cwd: myCwd,
           git_root: myGitRoot,
+          exclude_id: myId,
         });
         const sender = peers.find((p) => p.id === msg.from_id);
         if (sender) {
@@ -440,6 +466,12 @@ async function pollAndPushMessages() {
         },
       });
 
+      // Rendered to the user, so it is safe to destroy broker-side. Acking
+      // only after a successful push is what makes delivery durable: a crash
+      // between poll and push leaves the message queued for the next cycle.
+      pushedMessageIds.add(msg.id);
+      await ackMessages([msg.id]);
+
       log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
     }
   } catch (e) {
@@ -463,7 +495,7 @@ async function main() {
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
 
-  // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
+  // 3. Generate initial summary via Claude (non-blocking, best-effort)
   let initialSummary = "";
   const summaryPromise = (async () => {
     try {
@@ -496,6 +528,7 @@ async function main() {
     summary: initialSummary,
   });
   myId = reg.id;
+  myToken = reg.token;
   log(`Registered as peer ${myId}`);
 
   // If summary generation is still running, update it when done

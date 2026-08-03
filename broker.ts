@@ -10,6 +10,8 @@
  */
 
 import { Database } from "bun:sqlite";
+import { chmodSync } from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -21,16 +23,31 @@ import type {
   PollMessagesResponse,
   Peer,
   Message,
+  AckMessagesRequest,
+  AckMessagesResponse,
 } from "./shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const MSG_TTL_MS = parseInt(process.env.CLAUDE_PEERS_MSG_TTL ?? "3600000", 10);
 
 // --- Database setup ---
 
 const db = new Database(DB_PATH);
 db.run("PRAGMA journal_mode = WAL");
 db.run("PRAGMA busy_timeout = 3000");
+// Zero freed pages rather than leaving message text recoverable in the freelist.
+db.run("PRAGMA secure_delete = ON");
+
+// The database holds every inter-agent message. Default file creation is 0644,
+// which leaves it readable by any account on the machine.
+for (const suffix of ["", "-wal", "-shm"]) {
+  try {
+    chmodSync(`${DB_PATH}${suffix}`, 0o600);
+  } catch {
+    // -wal/-shm may not exist yet; they are re-chmodded on the next boot.
+  }
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS peers (
@@ -41,7 +58,8 @@ db.run(`
     tty TEXT,
     summary TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
-    last_seen TEXT NOT NULL
+    last_seen TEXT NOT NULL,
+    token TEXT
   )
 `);
 
@@ -58,6 +76,15 @@ db.run(`
   )
 `);
 
+// Add columns an older database predates. Every column the insert below writes
+// must appear here, or the broker crashes at boot against a legacy file.
+{
+  const existing = new Set(
+    (db.query("PRAGMA table_info(peers)").all() as { name: string }[]).map((c) => c.name)
+  );
+  if (!existing.has("token")) db.run("ALTER TABLE peers ADD COLUMN token TEXT");
+}
+
 // Clean up stale peers (PIDs that no longer exist) on startup
 function cleanStalePeers() {
   const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
@@ -68,7 +95,7 @@ function cleanStalePeers() {
     } catch {
       // Process doesn't exist, remove it
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+      db.run("DELETE FROM messages WHERE to_id = ?", [peer.id]);
     }
   }
 }
@@ -78,11 +105,16 @@ cleanStalePeers();
 // Periodically clean stale peers (every 30s)
 setInterval(cleanStalePeers, 30_000);
 
+
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, token)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const selectToken = db.prepare(`
+  SELECT token FROM peers WHERE id = ?
 `);
 
 const updateLastSeen = db.prepare(`
@@ -118,9 +150,26 @@ const selectUndelivered = db.prepare(`
   SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
 `);
 
-const markDelivered = db.prepare(`
-  UPDATE messages SET delivered = 1 WHERE id = ?
+// Acknowledgement deletes rather than flagging: a delivered message has no
+// further use, and retaining it leaves plaintext in the file indefinitely.
+//
+// The to_id predicate keeps a cooperating client from acking mail that is not
+// its own. It is NOT a security boundary: peer_id is supplied by the caller and
+// peer ids are public via /list-peers, so any local process can delete another
+// peer's queued mail. Closing that needs request authentication, which the
+// broker does not yet have. See docs/specs/RECOVERY.md, prerequisite 1.
+const ackMessage = db.prepare(`
+  DELETE FROM messages WHERE id = ? AND to_id = ?
 `);
+
+// Undelivered mail is swept once its TTL expires, otherwise rows now accumulate
+// forever: polling no longer consumes them.
+const sweepExpired = db.prepare(`
+  DELETE FROM messages WHERE sent_at < ?
+`);
+
+sweepExpiredMessages();
+setInterval(sweepExpiredMessages, 60_000);
 
 // --- Generate peer ID ---
 
@@ -145,8 +194,9 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
-  return { id };
+  const token = randomBytes(32).toString("hex");
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now, token);
+  return { id, token };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
@@ -209,18 +259,70 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
+  // Polling deliberately does NOT consume. Upstream marked messages delivered
+  // here, so a message was lost outright whenever the client polled but failed
+  // to render it. The client now acks once it has actually shown the message.
   const messages = selectUndelivered.all(body.id) as Message[];
-
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
-  }
-
   return { messages };
+}
+
+function handleAckMessages(body: AckMessagesRequest): AckMessagesResponse {
+  let acked = 0;
+  for (const id of body.message_ids) {
+    acked += ackMessage.run(id, body.peer_id).changes;
+  }
+  return { ok: true, acked };
+}
+
+function sweepExpiredMessages(): void {
+  const cutoff = new Date(Date.now() - MSG_TTL_MS).toISOString();
+  sweepExpired.run(cutoff);
 }
 
 function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
+}
+
+// --- Authentication ---
+
+/**
+ * Which body field names the calling peer, per route. The handler then trusts
+ * the authenticated identity rather than the body, so a caller cannot act as
+ * another peer by naming it.
+ */
+const CALLER_FIELD: Record<string, string> = {
+  "/heartbeat": "id",
+  "/set-summary": "id",
+  "/list-peers": "exclude_id",
+  "/send-message": "from_id",
+  "/poll-messages": "id",
+  "/ack-messages": "peer_id",
+  "/unregister": "id",
+};
+
+/**
+ * Verify the bearer token against the peer the body claims to be.
+ *
+ * Peer ids are public via /list-peers, so the id alone proves nothing. The
+ * token is 256 bits minted at registration and never leaves the owning process.
+ */
+function isAuthorized(req: Request, path: string, body: Record<string, unknown>): boolean {
+  const field = CALLER_FIELD[path];
+  if (!field) return true;
+
+  const claimed = body[field];
+  // /list-peers may omit exclude_id; an anonymous read is still a read of every
+  // session's cwd and summary, so it is refused rather than allowed through.
+  if (typeof claimed !== "string" || claimed.length === 0) return false;
+
+  const row = selectToken.get(claimed) as { token: string | null } | null;
+  if (!row?.token) return false;
+
+  const presented = (req.headers.get("authorization") ?? "").replace(/^Bearer /, "");
+  const a = Buffer.from(presented);
+  const b = Buffer.from(row.token);
+  // timingSafeEqual throws on a length mismatch, which is itself the answer.
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 // --- HTTP Server ---
@@ -242,6 +344,10 @@ Bun.serve({
     try {
       const body = await req.json();
 
+      if (!isAuthorized(req, path, body as Record<string, unknown>)) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+
       switch (path) {
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
@@ -257,6 +363,8 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/ack-messages":
+          return Response.json(handleAckMessages(body as AckMessagesRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });

@@ -137,7 +137,12 @@ const selectUndelivered = db.prepare(`
 
 // Acknowledgement deletes rather than flagging: a delivered message has no
 // further use, and retaining it leaves plaintext in the file indefinitely.
-// Scoped to the caller's own mailbox so a peer cannot ack another peer's mail.
+//
+// The to_id predicate keeps a cooperating client from acking mail that is not
+// its own. It is NOT a security boundary: peer_id is supplied by the caller and
+// peer ids are public via /list-peers, so any local process can delete another
+// peer's queued mail. Closing that needs request authentication, which the
+// broker does not yet have. See docs/specs/RECOVERY.md, prerequisite 1.
 const ackMessage = db.prepare(`
   DELETE FROM messages WHERE id = ? AND to_id = ?
 `);

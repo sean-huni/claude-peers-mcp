@@ -10,7 +10,7 @@ Anything that could not be verified from the repo is labelled **unverified**.
 
 ## 1. Orientation
 
-**What this branch is.** `{JIRA-TICKET}-feat-encryption` holds a design document and nothing
+**What this branch is.** `feat-encryption` holds a design document and nothing
 else: `docs/specs/e2e-encryption-federation.md` (160 lines, added by commit `e2c9dfc`) plus
 this recovery note. It specifies room-key end-to-end encryption and cross-machine federation
 for the claude-peers broker.
@@ -32,7 +32,7 @@ every message already sits in plaintext in `~/.claude/projects/**/*.jsonl` regar
 
 This is the single thing most likely to be garbled on re-reading, so it is stated twice.
 
-| | `{JIRA-TICKET}-feat-peers-hardening` | `{JIRA-TICKET}-feat-encryption` (this branch) |
+| | `feat-peers-hardening` | `feat-encryption` (this branch) |
 | --- | --- | --- |
 | Concern | **LOCAL data on ONE machine** | **CROSS-MACHINE confidentiality** |
 | Question it answers | "Can another process on this Mac read my agents' messages off disk, and do messages survive a failed render?" | "Can a broker operator on someone else's box read my agents' messages in flight?" |
@@ -65,6 +65,11 @@ the SHAs below.
    |
    f59d200  HARDENING (tip)        {JIRA-TICKET} Acknowledge pushed messages so they are not re-delivered
 ```
+
+> The `{JIRA-TICKET}` prefixes in the commit subjects above are literal: they are what those
+> commits actually say, and published history is corrected forward, never rewritten. The
+> **branches** were later renamed to drop the prefix, so every command in this file uses the
+> current names: `feat-encryption` and `feat-peers-hardening`.
 
 - `main` is upstream (`louislva/claude-peers-mcp`) and is behind both feature branches. It does
   not contain the auto-summary switch.
@@ -103,17 +108,17 @@ Run these from `/Users/sean/env/repo/ai/claude-peers-mcp`.
 # Where every branch actually is, right now.
 git branch -v
 git log --oneline main
-git log --oneline '{JIRA-TICKET}-feat-peers-hardening'
-git log --oneline '{JIRA-TICKET}-feat-encryption'
+git log --oneline feat-peers-hardening
+git log --oneline feat-encryption
 
 # The real divergence point, and what hardening added since.
-git merge-base '{JIRA-TICKET}-feat-encryption' '{JIRA-TICKET}-feat-peers-hardening'
-git diff --stat "$(git merge-base '{JIRA-TICKET}-feat-encryption' '{JIRA-TICKET}-feat-peers-hardening')" \
-  '{JIRA-TICKET}-feat-peers-hardening'
+git merge-base feat-encryption feat-peers-hardening
+git diff --stat "$(git merge-base feat-encryption feat-peers-hardening)" \
+  feat-peers-hardening
 
 # Read hardening code WITHOUT checking that branch out.
-git show '{JIRA-TICKET}-feat-peers-hardening:broker.ts'
-git show '{JIRA-TICKET}-feat-peers-hardening:shared/types.ts'
+git show 'feat-peers-hardening:broker.ts'
+git show 'feat-peers-hardening:shared/types.ts'
 ```
 
 > **Worktree note.** While this document was written, the hardening branch was checked out in a
@@ -124,7 +129,7 @@ git show '{JIRA-TICKET}-feat-peers-hardening:shared/types.ts'
 > **zsh trap that cost real time.** `git show "$REF:server.ts"` silently misbehaves in zsh when
 > `$REF` is a variable, because `:s` parses as a parameter-expansion modifier. It returned false
 > negatives that looked like "this code does not exist". Use a literal quoted ref
-> (`git show '{JIRA-TICKET}-feat-peers-hardening:server.ts'`) or brace the variable
+> (`git show 'feat-peers-hardening:server.ts'`) or brace the variable
 > (`"${REF}:server.ts"`).
 
 ---
@@ -177,7 +182,7 @@ shared branch.
 cd /Users/sean/env/repo/ai/claude-peers-mcp
 git worktree list          # is hardening checked out elsewhere?
 git status                 # must be clean before anything else
-git switch '{JIRA-TICKET}-feat-encryption'
+git switch feat-encryption
 ```
 
 ### Step 1: integrate on THIS branch, never on the trunk
@@ -188,8 +193,8 @@ work builds on.
 
 ```bash
 git fetch origin
-git switch '{JIRA-TICKET}-feat-encryption'
-git merge '{JIRA-TICKET}-feat-peers-hardening'    # resolve HERE, hardening wins by default
+git switch feat-encryption
+git merge feat-peers-hardening    # resolve HERE, hardening wins by default
 ```
 
 Do not merge this branch into hardening to "sync" it, and do not rebase hardening onto anything.
@@ -201,7 +206,7 @@ only `broker.ts`, `server.ts`, `shared/types.ts`. There is no file overlap, so t
 be a fast-forward of the code files with no conflict at all. Verify with:
 
 ```bash
-git diff --stat '{JIRA-TICKET}-feat-encryption' '{JIRA-TICKET}-feat-peers-hardening' -- docs/
+git diff --stat feat-encryption feat-peers-hardening -- docs/
 ```
 
 **Once this branch carries code, expect conflicts in exactly two files.**
@@ -375,6 +380,6 @@ through them in order is also the cheapest way to discover that you did not need
 
 1. `docs/specs/e2e-encryption-federation.md` in this branch. It is the authority. This file is
    navigation around it and deliberately does not restate its design decisions.
-2. `git show '{JIRA-TICKET}-feat-peers-hardening:broker.ts'` for what actually shipped locally.
+2. `git show 'feat-peers-hardening:broker.ts'` for what actually shipped locally.
 3. `README.md` for the user-facing model: broker daemon on `localhost:7899` with SQLite, one MCP
    server per Claude Code session, one second polling, channel push into the session.

@@ -145,6 +145,28 @@ Notes on the design:
   delivered twice.
 - Queues belonging to exited sessions are swept at startup, because pids are reused.
 
+## Losing the database
+
+`~/.claude-peers.db` can go away underneath a running system: you delete it, a cleanup script does,
+or the broker is restarted against a fresh one. Neither side needs a human to put it back.
+
+- **The broker recreates the schema in place.** It notices that the file it holds is no longer the
+  file on disk (or that a statement failed with an I/O error), reopens, and recreates the tables.
+  It does not exit: nothing supervises this daemon. It is spawned detached by whichever MCP server
+  found it missing at startup, so exiting would leave no broker at all until someone opened a new
+  session.
+- **Sessions re-register themselves.** Their peer row and bearer token die with the database, so the
+  broker answers 401. On the first refusal a session registers again, adopts the new id and token,
+  and retries the call once. This is single-flight, so several calls refused at the same moment
+  share one registration, and it is bounded: a refusal that survives re-registration is reported as
+  an error rather than retried in a loop.
+
+**Messages queued for the old peer id are lost.** They lived in the deleted database, and the peer
+id they were addressed to no longer exists. There is no replay: the sender is not told, and the
+recipient never sees them. Anything already spooled to disk for a hook-delivered session survives,
+because that queue is a separate file. **Your peer id changes** when this happens, so an id another
+session noted earlier stops resolving; `list_peers` shows the new one.
+
 ## Updating and relaunching
 
 There is **no build step**. Bun runs the TypeScript directly, so "the latest code" just means the

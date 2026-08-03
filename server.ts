@@ -58,7 +58,87 @@ const VERSION = (pkg as { version: string }).version;
 
 // --- Broker communication ---
 
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+/**
+ * Which body field carries this session's own id, per route.
+ *
+ * The broker authenticates the token against the peer the body names, so a
+ * re-registration has to rewrite the body as well as the module state. Missing
+ * this leaves the retry presenting a fresh token for a peer id that no longer
+ * exists, which is refused exactly like the original call.
+ */
+const CALLER_FIELD: Record<string, string> = {
+  "/heartbeat": "id",
+  "/set-summary": "id",
+  "/list-peers": "exclude_id",
+  "/send-message": "from_id",
+  "/poll-messages": "id",
+  "/ack-messages": "peer_id",
+  "/unregister": "id",
+};
+
+function withCallerId(path: string, body: unknown): unknown {
+  const field = CALLER_FIELD[path];
+  if (!field || typeof body !== "object" || body === null) return body;
+  return { ...(body as Record<string, unknown>), [field]: myId };
+}
+
+/** In-flight re-registration, so concurrent refusals share one attempt. */
+let reregistration: Promise<void> | null = null;
+
+async function registerWithBroker(): Promise<RegisterResponse> {
+  return brokerFetch<RegisterResponse>(
+    "/register",
+    {
+      pid: process.pid,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      tty: myTty,
+      summary: mySummary,
+    },
+    false
+  );
+}
+
+/**
+ * Take a new identity after the broker stopped recognising the old one.
+ *
+ * Session identity lived only in this process's memory and was established once
+ * at startup, so a broker restarted against an empty database refused every
+ * call with 401, permanently, and the only remedy was restarting the Claude
+ * Code session. See https://12factor.net/disposability.
+ *
+ * Single-flight and bounded: several calls are usually in flight when the
+ * identity dies (the poll loop, the heartbeat, whatever tool the model is
+ * running), and one registration per refusal would leave the session holding
+ * several identities, only the last of which anyone could reach. A caller whose
+ * identity was already replaced while it waited simply retries with the new one.
+ */
+async function recoverIdentity(staleId: PeerId | null): Promise<void> {
+  if (myId !== staleId) return; // already replaced by another caller
+  if (reregistration) return reregistration;
+
+  reregistration = (async () => {
+    try {
+      const reg = await registerWithBroker();
+      myId = reg.id;
+      myToken = reg.token;
+      // Message ids restart from 1 in a rebuilt database, so ids remembered
+      // from the old one would suppress genuinely new messages as duplicates.
+      pushedMessageIds.clear();
+      log(`Re-registered as peer ${myId} after the broker rejected the previous identity`);
+    } finally {
+      reregistration = null;
+    }
+  })();
+
+  return reregistration;
+}
+
+async function brokerFetch<T>(path: string, body: unknown, recoverable = true): Promise<T> {
+  // Captured before the call: by the time a 401 comes back, another caller may
+  // already have re-registered, and this request only needs to adopt that.
+  const identityAtRequest = myId;
+
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: {
@@ -67,6 +147,16 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
     },
     body: JSON.stringify(body),
   });
+
+  // 401 is the broker saying this peer id and token are unknown to it, which
+  // after a database loss is true of every live session. Register again and
+  // retry once. Once, never in a loop: a second refusal is a real failure and
+  // is reported rather than retried.
+  if (res.status === 401 && recoverable && path !== "/register") {
+    await recoverIdentity(identityAtRequest);
+    return brokerFetch<T>(path, withCallerId(path, body), false);
+  }
+
   if (!res.ok) {
     const err = await res.text();
     throw new Error(`Broker error (${path}): ${res.status} ${err}`);
@@ -159,6 +249,10 @@ let myId: PeerId | null = null;
 let myToken: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+// Kept so a re-registration can reconstruct the same peer rather than a
+// nameless one: the broker's copy of both is lost with its database.
+let myTty: string | null = null;
+let mySummary = "";
 
 // --- MCP Server ---
 
@@ -361,6 +455,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
+        // Remembered so a later re-registration carries it: the broker's copy
+        // dies with its database.
+        mySummary = summary;
         return {
           content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
         };
@@ -621,11 +718,11 @@ async function main() {
   // 2. Gather context
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
-  const tty = getTty();
+  myTty = getTty();
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
-  log(`TTY: ${tty ?? "(unknown)"}`);
+  log(`TTY: ${myTty ?? "(unknown)"}`);
 
   // 3. Generate initial summary via Claude (non-blocking, best-effort)
   let initialSummary = "";
@@ -641,6 +738,7 @@ async function main() {
       });
       if (summary) {
         initialSummary = summary;
+        mySummary = summary;
         log(`Auto-summary: ${summary}`);
       }
     } catch (e) {
@@ -652,13 +750,7 @@ async function main() {
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
   // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    summary: initialSummary,
-  });
+  const reg = await registerWithBroker();
   myId = reg.id;
   myToken = reg.token;
   log(`Registered as peer ${myId}`);

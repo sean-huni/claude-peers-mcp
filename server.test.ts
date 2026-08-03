@@ -9,22 +9,53 @@
  */
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { rmSync, mkdtempSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import {
+  cleanupAll,
+  reserveFreePort,
+  sweepBrokerOnPort,
+  trackProcess,
+  trackedTempDir,
+} from "./testsupport";
 
-const PORT = 7961 + Math.floor(Math.random() * 30);
-const DB = `${process.env.TMPDIR ?? "/tmp"}/claude-peers-servertest-${PORT}.db`;
-const ENV = { ...process.env, CLAUDE_PEERS_PORT: String(PORT), CLAUDE_PEERS_DB: DB };
+const PORT = reserveFreePort();
+const WORK = trackedTempDir("peers-servertest-");
+const DB = join(WORK, "broker.db");
+const ENV = {
+  ...process.env,
+  CLAUDE_PEERS_PORT: String(PORT),
+  CLAUDE_PEERS_DB: DB,
+  // Never the real one under $HOME. Without this the servers spawned here resolve a session pid by
+  // walking their own process tree, land on the developer's live Claude Code session, and spool
+  // test traffic into a queue a hook is actively draining into someone's context.
+  CLAUDE_PEERS_SPOOL_DIR: join(WORK, "spool"),
+};
 
 const clients: { proc: ReturnType<typeof Bun.spawn> }[] = [];
 
+/**
+ * Each client is told which session it belongs to instead of deriving one.
+ *
+ * Derivation finds the ancestor Claude Code session, which every client here shares, so they all
+ * spool into ONE queue and drain each other's messages. Pointing each at a live process of its own
+ * gives every client the isolated queue a real session has.
+ */
 function spawnClient(cwd: string, withChannel: boolean, channelMode?: string) {
-  const proc = Bun.spawn(["bun", `${import.meta.dir}/server.ts`], {
-    cwd,
-    env: channelMode ? { ...ENV, CLAUDE_PEERS_CHANNEL: channelMode } : ENV,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "ignore",
-  });
+  const session = trackProcess(Bun.spawn(["sleep", "600"], { stdout: "ignore", stderr: "ignore" }));
+  const env = {
+    ...ENV,
+    CLAUDE_PEERS_SESSION_PID: String(session.pid),
+    ...(channelMode ? { CLAUDE_PEERS_CHANNEL: channelMode } : {}),
+  };
+  const proc = trackProcess(
+    Bun.spawn(["bun", `${import.meta.dir}/server.ts`], {
+      cwd,
+      env,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "ignore",
+    })
+  );
 
   const replies = new Map<number, any>();
   const notifications: any[] = [];
@@ -99,25 +130,24 @@ function peerIdAt(listing: string, cwd: string): string {
 
 /** Each client gets its own directory so it is addressable unambiguously. */
 function workdir(): string {
-  // realpath matters: TMPDIR is a symlink on macOS (/var -> /private/var) and
-  // may carry a trailing slash, so the raw path never matches the cwd the
-  // server reports back through list_peers.
-  return realpathSync(mkdtempSync(`${(process.env.TMPDIR ?? "/tmp").replace(/\/$/, "")}/peers-test-`));
+  // Tracked, so it is removed at the end of the run. These used to accumulate: roughly ten per run,
+  // for as long as anyone had been running the suite.
+  return trackedTempDir("peers-test-");
 }
 
 let broker: ReturnType<typeof Bun.spawn>;
 
 beforeAll(async () => {
-  for (const suffix of ["", "-wal", "-shm"]) rmSync(`${DB}${suffix}`, { force: true });
-
   // Start the broker here rather than letting the first server auto-spawn it.
   // A detached grandchild does not settle reliably inside the test runner, and
   // every client then blocks waiting for a broker that never answers.
-  broker = Bun.spawn(["bun", `${import.meta.dir}/broker.ts`], {
-    env: ENV,
-    stdout: "ignore",
-    stderr: "ignore",
-  });
+  broker = trackProcess(
+    Bun.spawn(["bun", `${import.meta.dir}/broker.ts`], {
+      env: ENV,
+      stdout: "ignore",
+      stderr: "ignore",
+    })
+  );
   for (let i = 0; i < 40; i++) {
     await Bun.sleep(100);
     try {
@@ -129,16 +159,17 @@ beforeAll(async () => {
   throw new Error(`broker did not come up on ${PORT}`);
 });
 
-afterAll(async () => {
-  for (const c of clients) c.proc.kill();
-  broker?.kill();
+// Unconditional: this runs after a passing suite, a failing assertion and a throwing beforeAll
+// alike, and each step is isolated so an early failure cannot skip the ones after it.
+//
+// The sweep is NOT `lsof -ti :PORT | xargs kill`, which was here before: that signals every process
+// holding a socket on the port, and once Bun has pooled a connection the test runner is one of them.
+afterAll(() => {
   try {
-    await fetch(`http://127.0.0.1:${PORT}/health`).then((r) => r.text());
-  } catch {
-    // broker already gone
+    cleanupAll();
+  } finally {
+    sweepBrokerOnPort(PORT);
   }
-  Bun.spawnSync(["sh", "-c", `lsof -ti :${PORT} | xargs kill`]);
-  for (const suffix of ["", "-wal", "-shm"]) rmSync(`${DB}${suffix}`, { force: true });
 });
 
 test("a client that cannot render channel notifications still receives messages", async () => {

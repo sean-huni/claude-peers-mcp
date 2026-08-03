@@ -7,20 +7,32 @@
  */
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { rmSync } from "node:fs";
+import { join } from "node:path";
+import {
+  cleanupAll,
+  reserveFreePort,
+  sweepBrokerOnPort,
+  trackProcess,
+  trackedTempDir,
+} from "./testsupport";
 
-const PORT = 7901 + Math.floor(Math.random() * 15);
-const DB = `${process.env.TMPDIR ?? "/tmp"}/claude-peers-clitest-${PORT}.db`;
-const ENV = { ...process.env, CLAUDE_PEERS_PORT: String(PORT), CLAUDE_PEERS_DB: DB };
+const PORT = reserveFreePort();
+const WORK = trackedTempDir("peers-clitest-");
+const DB = join(WORK, "broker.db");
+const ENV = {
+  ...process.env,
+  CLAUDE_PEERS_PORT: String(PORT),
+  CLAUDE_PEERS_DB: DB,
+  // Never the real one under $HOME: the CLI resolves a session pid from the process tree, and on a
+  // developer machine that tree ends at a live Claude Code session whose queue is not ours to write.
+  CLAUDE_PEERS_SPOOL_DIR: join(WORK, "spool"),
+};
 const BASE = `http://127.0.0.1:${PORT}`;
 
 let broker: ReturnType<typeof Bun.spawn>;
-const holders: ReturnType<typeof Bun.spawn>[] = [];
 
 function livePid(): number {
-  const p = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
-  holders.push(p);
-  return p.pid;
+  return trackProcess(Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" })).pid;
 }
 
 async function cli(...args: string[]): Promise<string> {
@@ -36,12 +48,13 @@ async function cli(...args: string[]): Promise<string> {
 }
 
 beforeAll(async () => {
-  for (const suffix of ["", "-wal", "-shm"]) rmSync(`${DB}${suffix}`, { force: true });
-  broker = Bun.spawn(["bun", `${import.meta.dir}/broker.ts`], {
-    env: ENV,
-    stdout: "ignore",
-    stderr: "ignore",
-  });
+  broker = trackProcess(
+    Bun.spawn(["bun", `${import.meta.dir}/broker.ts`], {
+      env: ENV,
+      stdout: "ignore",
+      stderr: "ignore",
+    })
+  );
   for (let i = 0; i < 40; i++) {
     await Bun.sleep(100);
     try {
@@ -53,10 +66,14 @@ beforeAll(async () => {
   throw new Error(`broker did not come up on ${PORT}`);
 });
 
+// Unconditional: this runs after a passing suite, a failing assertion and a throwing beforeAll
+// alike, and each step is isolated so an early failure cannot skip the ones after it.
 afterAll(() => {
-  for (const h of holders) h.kill();
-  broker?.kill();
-  for (const suffix of ["", "-wal", "-shm"]) rmSync(`${DB}${suffix}`, { force: true });
+  try {
+    cleanupAll();
+  } finally {
+    sweepBrokerOnPort(PORT);
+  }
 });
 
 test("status reports a running broker rather than claiming it is down", async () => {

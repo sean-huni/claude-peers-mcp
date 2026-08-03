@@ -5,14 +5,15 @@
  * Utility commands for managing the broker and inspecting peers.
  *
  * Usage:
- *   bun cli.ts status          — Show broker status and all peers
- *   bun cli.ts peers           — List all peers
- *   bun cli.ts send <id> <msg> — Send a message to a peer
- *   bun cli.ts inbox          — Drain messages spooled for THIS session (used by the hook)
- *   bun cli.ts kill-broker     — Stop the broker daemon
+ *   bun cli.ts status          Show broker status and all peers
+ *   bun cli.ts peers           List all peers
+ *   bun cli.ts send <id> <msg> Send a message to a peer
+ *   bun cli.ts inbox           Drain messages spooled for THIS session (used by the hook)
+ *   bun cli.ts kill-broker     Stop the broker daemon
  */
 
 import { drainSpool, findSessionPid } from "./spool";
+import { listeningBrokerPids } from "./shared/procs";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -231,15 +232,15 @@ switch (cmd) {
     try {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
       console.log(`Broker has ${health.peers} peer(s). Shutting down...`);
-      // Find and kill the broker process on the port
-      const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
-      const pids = new TextDecoder()
-        .decode(proc.stdout)
-        .trim()
-        .split("\n")
-        .filter((p) => p);
+      // Only the process LISTENING on the port, and only if it really is the broker. Signalling
+      // every pid holding a socket here used to SIGTERM the connected sessions as well.
+      const pids = listeningBrokerPids(BROKER_PORT);
+      if (pids.length === 0) {
+        console.log(`No broker process is listening on ${BROKER_PORT}. Nothing was stopped.`);
+        break;
+      }
       for (const pid of pids) {
-        process.kill(parseInt(pid), "SIGTERM");
+        process.kill(pid, "SIGTERM");
       }
       console.log("Broker stopped.");
     } catch {

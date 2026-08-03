@@ -26,6 +26,7 @@ import type {
   PollMessagesResponse,
   Message,
 } from "./shared/types.ts";
+import { fileURLToPath } from "node:url";
 import pkg from "./package.json";
 import {
   generateSummary,
@@ -39,7 +40,9 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+// fileURLToPath, not .pathname: the latter is percent-encoded, so any install
+// directory containing a space yields a module-not-found at broker launch.
+const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
 // Sourced from package.json so the version reported to MCP clients cannot
 // drift from the released one.
 const VERSION = (pkg as { version: string }).version;
@@ -497,7 +500,9 @@ async function pollAndPushMessages() {
       pushedMessageIds.add(msg.id);
       await ackMessages([msg.id]);
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      // Log the fact, never the text: stderr is captured to a log file that has
+// none of the database's permission, secure_delete or TTL protections.
+      log(`Pushed message from ${msg.from_id} (${msg.text.length} chars)`);
     }
   } catch (e) {
     // Broker might be down temporarily, don't crash

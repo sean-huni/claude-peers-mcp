@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, describe } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -101,9 +101,9 @@ describe("spooling", () => {
   test("the queue is not world-readable, because messages are private", () => {
     spoolMessage(4242, message(1, "sensitive"));
 
-    const mode = Bun.file(spoolPath(4242)).stat
-      ? require("node:fs").statSync(spoolPath(4242)).mode & 0o777
-      : 0;
+    // statSync directly: Bun.file(...).stat is a method reference, so using it
+    // as a condition is always true and typechecks as an error.
+    const mode = statSync(spoolPath(4242)).mode & 0o777;
     expect(mode & 0o077).toBe(0);
   });
 

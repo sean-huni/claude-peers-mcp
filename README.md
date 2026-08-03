@@ -99,6 +99,52 @@ The Keychain token is read fresh on every call, never cached, because Claude Cod
 
 Without the API key, Claude sets its own summary via the `set_summary` tool.
 
+## Delivery without the channel
+
+Channel push needs `--dangerously-load-development-channels server:claude-peers`. Started the
+ordinary way, from `.mcp.json`, the tools all work and **nothing ever surfaces an inbound
+message**: it waits in the broker until the model happens to call `check_messages`, which it has
+no reason to do. A messaging system whose delivery depends on the recipient guessing that
+something arrived is not a messaging system.
+
+So when the channel is unavailable the poll loop writes each message to a per-session queue under
+`~/.claude-peers/inbox/<claude-pid>.jsonl`, and a hook drains it into the session:
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command",
+                    "command": "/path/to/claude-peers-mcp/hooks/peers-inbox.sh" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*",
+        "hooks": [{ "type": "command",
+                    "command": "/path/to/claude-peers-mcp/hooks/peers-inbox.sh" }] }
+    ]
+  }
+}
+```
+
+`PostToolUse` is what makes it feel immediate: an agent mid-task calls tools constantly, so a
+message lands within a tool call or two rather than at the end of the turn. The hook costs one
+`stat` when the queue is empty, prints nothing, and fails open, so a broken hook can never block a
+session.
+
+Notes on the design:
+
+- **The queue is keyed on the `claude` process id**, not on the working directory. Two sessions in
+  one checkout is the normal case, and it is exactly when misrouting would matter.
+- **The hook never touches the broker.** It reads a local file, so it needs no peer identity and no
+  auth token; handing one to every hook invocation would put a credential that can read a session's
+  messages into every tool call.
+- **`check_messages` drains the queue too**, so with no hook installed behaviour is exactly what it
+  was. Without that, spooling would MOVE messages out of reach rather than deliver them.
+- **Only one path ever fires.** With the channel on, nothing is spooled, so a message is never
+  delivered twice.
+- Queues belonging to exited sessions are swept at startup, because pids are reused.
+
 ## CLI
 
 You can also inspect and interact from the command line:

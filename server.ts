@@ -28,6 +28,7 @@ import type {
 } from "./shared/types.ts";
 import { fileURLToPath } from "node:url";
 import pkg from "./package.json";
+import { drainSpool, findSessionPid, spoolMessage, sweepDeadSpools } from "./spool";
 import {
   generateSummary,
   getGitBranch,
@@ -376,15 +377,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
+        // Anything the poll loop already spooled is drained here too, so this tool keeps working
+        // exactly as it did when the hook is not installed. Without this, spooling would MOVE
+        // messages out of reach: check_messages would answer "no new messages" while they sat in a
+        // file nobody was reading, which is worse than the problem the spool solves. Caught by
+        // three existing tests, which is what they were for.
+        const spooled = sessionPid === null ? [] : drainSpool(sessionPid);
         const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-        if (result.messages.length === 0) {
+
+        if (spooled.length === 0 && result.messages.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
         }
-        const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
-        );
+
+        // Spooled first: they arrived earlier, and a conversation read out of order is not a
+        // conversation.
+        const lines = [
+          ...spooled.map((m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`),
+          ...result.messages.map((m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`),
+        ];
+        const total = spooled.length + result.messages.length;
         // Rendered to the caller, so acknowledge it. Polling no longer
         // consumes, so without this the same message is returned every time.
         await ackMessages(result.messages.map((m) => m.id));
@@ -393,7 +406,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           content: [
             {
               type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
+              text: `${total} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
             },
           ],
         };
@@ -481,11 +494,20 @@ function clientRendersChannel(): boolean {
   return channelEnabled;
 }
 
+/**
+ * The session this server belongs to, for spooled delivery.
+ *
+ * Resolved once: the parent cannot change, and re-deriving it on every cycle would run two `ps`
+ * calls a second for the life of the session.
+ */
+const sessionPid: number | null = findSessionPid();
+
 async function pollAndPushMessages() {
   if (!myId) return;
-  // No channel means no push. The message stays queued and is delivered by
-  // check_messages instead, which is the documented fallback.
-  if (!clientRendersChannel()) return;
+  // Without a channel AND without a resolvable session there is nowhere to deliver, so the message
+  // stays queued for check_messages. That is the only remaining case where a message waits to be
+  // asked for.
+  if (!clientRendersChannel() && sessionPid === null) return;
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
@@ -511,29 +533,43 @@ async function pollAndPushMessages() {
         // Non-critical, proceed without sender info
       }
 
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
+      if (clientRendersChannel()) {
+        // Push as channel notification — this is what makes it immediate
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              from_summary: fromSummary,
+              from_cwd: fromCwd,
+              sent_at: msg.sent_at,
+            },
           },
-        },
-      });
+        });
+        log(`Pushed message from ${msg.from_id} (${msg.text.length} chars)`);
+      } else {
+        // No channel, so write it where a hook will find it. Throws on a failed write, which skips
+        // the ack below and leaves the message queued for the next cycle: the same durability rule
+        // the push path relies on.
+        spoolMessage(sessionPid!, {
+          id: msg.id,
+          from_id: msg.from_id,
+          from_summary: fromSummary,
+          from_cwd: fromCwd,
+          sent_at: msg.sent_at,
+          text: msg.text,
+        });
+        log(`Spooled message from ${msg.from_id} (${msg.text.length} chars)`);
+      }
 
-      // Rendered to the user, so it is safe to destroy broker-side. Acking
-      // only after a successful push is what makes delivery durable: a crash
-      // between poll and push leaves the message queued for the next cycle.
+      // Handed to something that will render it, so it is safe to destroy broker-side. Acking only
+      // after delivery is what makes it durable: a crash in between leaves the message queued.
+      //
+      // Log the fact, never the text: stderr is captured to a log file that has none of the
+      // database's permission, secure_delete or TTL protections.
       pushedMessageIds.add(msg.id);
       await ackMessages([msg.id]);
-
-      // Log the fact, never the text: stderr is captured to a log file that has
-// none of the database's permission, secure_delete or TTL protections.
-      log(`Pushed message from ${msg.from_id} (${msg.text.length} chars)`);
     }
   } catch (e) {
     // Broker might be down temporarily, don't crash
@@ -611,6 +647,16 @@ async function main() {
   log("MCP connected");
 
   // 6. Start polling for inbound messages
+  //
+  // Clear out queues belonging to sessions that have since exited. A pid is reused eventually, and
+  // inheriting a dead session's unread messages would deliver somebody else's conversation into
+  // this one. Cheap, and once per process is enough: the risk arrives with a NEW session, which
+  // runs this itself.
+  try {
+    sweepDeadSpools();
+  } catch {
+    // A queue that cannot be swept is not a reason to refuse to start.
+  }
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
   // 7. Start heartbeat

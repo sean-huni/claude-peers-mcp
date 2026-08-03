@@ -378,6 +378,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const lines = result.messages.map(
           (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
         );
+        // Rendered to the caller, so acknowledge it. Polling no longer
+        // consumes, so without this the same message is returned every time.
+        await ackMessages(result.messages.map((m) => m.id));
+        for (const m of result.messages) pushedMessageIds.add(m.id);
         return {
           content: [
             {
@@ -425,8 +429,25 @@ async function ackMessages(ids: number[]): Promise<void> {
   }
 }
 
+/**
+ * Whether the client can render channel notifications.
+ *
+ * Claude Code only advertises this when launched with the development-channels
+ * flag. Pushing to a client that cannot render is worse than not pushing: the
+ * message is acknowledged, deleted, and never seen.
+ */
+function clientRendersChannel(): boolean {
+  const experimental = mcp.getClientCapabilities()?.experimental as
+    | Record<string, unknown>
+    | undefined;
+  return Boolean(experimental?.["claude/channel"]);
+}
+
 async function pollAndPushMessages() {
   if (!myId) return;
+  // No channel means no push. The message stays queued and is delivered by
+  // check_messages instead, which is the documented fallback.
+  if (!clientRendersChannel()) return;
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });

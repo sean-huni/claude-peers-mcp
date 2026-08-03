@@ -437,17 +437,48 @@ async function ackMessages(ids: number[]): Promise<void> {
 }
 
 /**
- * Whether the client can render channel notifications.
+ * Whether this session can render channel notifications.
  *
- * Claude Code only advertises this when launched with the development-channels
- * flag. Pushing to a client that cannot render is worse than not pushing: the
- * message is acknowledged, deleted, and never seen.
+ * Claude Code does NOT advertise the channel as an MCP capability. Its
+ * initialize frame carries only {roots, elicitation}, with no experimental
+ * field, even when launched with --dangerously-load-development-channels.
+ * Gating on a client capability therefore disables push for every real
+ * session, which is exactly the bug this replaces.
+ *
+ * The flag is instead visible in the parent process's argv, where it names the
+ * servers allowed to push: `--dangerously-load-development-channels
+ * server:claude-peers`. That is the only honest signal available, so read it
+ * once at startup. CLAUDE_PEERS_CHANNEL=always|never overrides, for tests and
+ * for hosts where reading the parent is not possible.
+ *
+ * Pushing to a session that cannot render is worse than not pushing, because
+ * the message is acknowledged and deleted unseen. So when detection is
+ * genuinely impossible the safe answer is no push: the message stays queued
+ * and check_messages still delivers it.
  */
+const SERVER_NAME = "claude-peers";
+
+function detectChannelEnabled(): boolean {
+  const override = process.env.CLAUDE_PEERS_CHANNEL;
+  if (override === "always") return true;
+  if (override === "never") return false;
+
+  try {
+    const parent = Bun.spawnSync(["ps", "-o", "command=", "-p", String(process.ppid)]);
+    const argv = new TextDecoder().decode(parent.stdout);
+    if (!argv.includes("dangerously-load-development-channels")) return false;
+    // The flag lists which servers may push. Only claim the channel when this
+    // server is one of them.
+    return argv.includes(`server:${SERVER_NAME}`);
+  } catch {
+    return false;
+  }
+}
+
+const channelEnabled = detectChannelEnabled();
+
 function clientRendersChannel(): boolean {
-  const experimental = mcp.getClientCapabilities()?.experimental as
-    | Record<string, unknown>
-    | undefined;
-  return Boolean(experimental?.["claude/channel"]);
+  return channelEnabled;
 }
 
 async function pollAndPushMessages() {

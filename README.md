@@ -145,6 +145,76 @@ Notes on the design:
   delivered twice.
 - Queues belonging to exited sessions are swept at startup, because pids are reused.
 
+## Updating and relaunching
+
+There is **no build step**. Bun runs the TypeScript directly, so "the latest code" just means the
+latest files on disk when a process starts. Nothing is compiled and there is no `dist/`.
+
+Two things update independently:
+
+| What | How | When it takes effect |
+|---|---|---|
+| Claude Code itself | `claude update` | Next time you start `claude` |
+| This repo | `git pull` | Next time each process starts (see below) |
+
+### The three processes, and which ones you must restart
+
+1. **The broker** is a singleton daemon on port 7899 that **outlives your sessions**. Restarting a
+   terminal does NOT restart it. This is the one people miss: you pull a fix, restart everything,
+   and the old broker is still serving the old code.
+2. **One MCP server per session** (`bun server.ts`), started by Claude Code. It reads the source at
+   launch, so it needs a session restart.
+3. **Claude Code** itself, one per terminal.
+
+### Full relaunch
+
+```bash
+cd /path/to/claude-peers-mcp
+
+# 1. Get the latest code and dependencies
+git pull
+bun install
+
+# 2. Stop the broker. It respawns automatically on the next session start.
+#    -sTCP:LISTEN matters: without it lsof also returns every CONNECTED client,
+#    so a bare `lsof -ti :7899 | xargs kill` kills your MCP servers too.
+lsof -ti :7899 -sTCP:LISTEN | xargs kill 2>/dev/null
+
+# 3. Confirm it is actually down before continuing (this should fail)
+curl -s --max-time 2 localhost:7899/health || echo "broker is down, good"
+
+# 4. Update Claude Code itself
+claude update
+```
+
+Then **exit every Claude Code session** and relaunch each terminal:
+
+```bash
+claude --dangerously-load-development-channels server:claude-peers
+```
+
+### Verify the new code is actually live
+
+Do not assume the restart worked. Check:
+
+```bash
+# Prints the broker status and every registered session.
+# "Broker request failed" or a missing peer list means something did not restart.
+bun cli.ts peers
+
+# Confirm each session sees the others
+#   in any session, ask Claude to call list_peers with scope "machine"
+```
+
+A quick way to tell whether the broker is stale: check how long it has been running against when
+you last pulled.
+
+```bash
+ps -o lstart=,command= -p "$(lsof -ti :7899 -sTCP:LISTEN)"
+```
+
+If that timestamp is older than your last `git pull`, the broker is running old code.
+
 ## CLI
 
 You can also inspect and interact from the command line:

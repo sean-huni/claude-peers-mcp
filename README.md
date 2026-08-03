@@ -259,6 +259,19 @@ bun cli.ts kill-broker       # stop the broker
 | `ANTHROPIC_API_KEY`  | Keychain OAuth token | Auto-summary credential (optional)    |
 
 
+## Benchmarking delivery
+
+```bash
+bun run bench                                   # full run, roughly 3 to 4 minutes
+bun bench/delivery-latency.ts --json-out out.json
+```
+
+Measures send-to-render latency, burst behaviour, one-to-many latency when a `broadcast_message`
+tool exists, and the broker request volume of an idle session. It feature-detects, so the same
+harness runs unchanged on every branch, and it exits non-zero rather than reporting statistics drawn
+from messages that never arrived. Method, guards and the ways the numbers could still mislead are in
+[`bench/README.md`](bench/README.md).
+
 ## Quicker Launch
 
 The sequence after dev is confirmed

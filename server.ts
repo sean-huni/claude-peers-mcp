@@ -29,6 +29,7 @@ import type {
 import { fileURLToPath } from "node:url";
 import pkg from "./package.json";
 import { drainSpool, findSessionPid, spoolMessage, sweepDeadSpools } from "./spool";
+import { PollBackoff } from "./poll-backoff.ts";
 import {
   generateSummary,
   getGitBranch,
@@ -41,6 +42,13 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
+// A broker that is down must not cost a log line per poll. Config from the
+// environment so an operator can tune the noise without a rebuild.
+const POLL_BACKOFF_MAX_MS = parseInt(
+  process.env.CLAUDE_PEERS_POLL_BACKOFF_MAX_MS ?? "60000",
+  10
+);
+const POLL_QUIET_MS = parseInt(process.env.CLAUDE_PEERS_POLL_QUIET_MS ?? "300000", 10);
 // fileURLToPath, not .pathname: the latter is percent-encoded, so any install
 // directory containing a space yields a module-not-found at broker launch.
 const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
@@ -50,7 +58,87 @@ const VERSION = (pkg as { version: string }).version;
 
 // --- Broker communication ---
 
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+/**
+ * Which body field carries this session's own id, per route.
+ *
+ * The broker authenticates the token against the peer the body names, so a
+ * re-registration has to rewrite the body as well as the module state. Missing
+ * this leaves the retry presenting a fresh token for a peer id that no longer
+ * exists, which is refused exactly like the original call.
+ */
+const CALLER_FIELD: Record<string, string> = {
+  "/heartbeat": "id",
+  "/set-summary": "id",
+  "/list-peers": "exclude_id",
+  "/send-message": "from_id",
+  "/poll-messages": "id",
+  "/ack-messages": "peer_id",
+  "/unregister": "id",
+};
+
+function withCallerId(path: string, body: unknown): unknown {
+  const field = CALLER_FIELD[path];
+  if (!field || typeof body !== "object" || body === null) return body;
+  return { ...(body as Record<string, unknown>), [field]: myId };
+}
+
+/** In-flight re-registration, so concurrent refusals share one attempt. */
+let reregistration: Promise<void> | null = null;
+
+async function registerWithBroker(): Promise<RegisterResponse> {
+  return brokerFetch<RegisterResponse>(
+    "/register",
+    {
+      pid: process.pid,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      tty: myTty,
+      summary: mySummary,
+    },
+    false
+  );
+}
+
+/**
+ * Take a new identity after the broker stopped recognising the old one.
+ *
+ * Session identity lived only in this process's memory and was established once
+ * at startup, so a broker restarted against an empty database refused every
+ * call with 401, permanently, and the only remedy was restarting the Claude
+ * Code session. See https://12factor.net/disposability.
+ *
+ * Single-flight and bounded: several calls are usually in flight when the
+ * identity dies (the poll loop, the heartbeat, whatever tool the model is
+ * running), and one registration per refusal would leave the session holding
+ * several identities, only the last of which anyone could reach. A caller whose
+ * identity was already replaced while it waited simply retries with the new one.
+ */
+async function recoverIdentity(staleId: PeerId | null): Promise<void> {
+  if (myId !== staleId) return; // already replaced by another caller
+  if (reregistration) return reregistration;
+
+  reregistration = (async () => {
+    try {
+      const reg = await registerWithBroker();
+      myId = reg.id;
+      myToken = reg.token;
+      // Message ids restart from 1 in a rebuilt database, so ids remembered
+      // from the old one would suppress genuinely new messages as duplicates.
+      pushedMessageIds.clear();
+      log(`Re-registered as peer ${myId} after the broker rejected the previous identity`);
+    } finally {
+      reregistration = null;
+    }
+  })();
+
+  return reregistration;
+}
+
+async function brokerFetch<T>(path: string, body: unknown, recoverable = true): Promise<T> {
+  // Captured before the call: by the time a 401 comes back, another caller may
+  // already have re-registered, and this request only needs to adopt that.
+  const identityAtRequest = myId;
+
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: {
@@ -59,6 +147,16 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
     },
     body: JSON.stringify(body),
   });
+
+  // 401 is the broker saying this peer id and token are unknown to it, which
+  // after a database loss is true of every live session. Register again and
+  // retry once. Once, never in a loop: a second refusal is a real failure and
+  // is reported rather than retried.
+  if (res.status === 401 && recoverable && path !== "/register") {
+    await recoverIdentity(identityAtRequest);
+    return brokerFetch<T>(path, withCallerId(path, body), false);
+  }
+
   if (!res.ok) {
     const err = await res.text();
     throw new Error(`Broker error (${path}): ${res.status} ${err}`);
@@ -151,6 +249,10 @@ let myId: PeerId | null = null;
 let myToken: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+// Kept so a re-registration can reconstruct the same peer rather than a
+// nameless one: the broker's copy of both is lost with its database.
+let myTty: string | null = null;
+let mySummary = "";
 
 // --- MCP Server ---
 
@@ -353,6 +455,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
+        // Remembered so a later re-registration carries it: the broker's copy
+        // dies with its database.
+        mySummary = summary;
         return {
           content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
         };
@@ -502,15 +607,36 @@ function clientRendersChannel(): boolean {
  */
 const sessionPid: number | null = findSessionPid();
 
+/**
+ * Retry schedule and log rate limiting for the loop below.
+ *
+ * The timer still fires every second, because that is the latency a reachable
+ * broker deserves. When the broker is unreachable this holds the loop off on a
+ * growing interval and suppresses the repeat log lines, which otherwise filled
+ * the session's MCP log file at one line a second for as long as the outage
+ * lasted.
+ */
+const pollBackoff = new PollBackoff({
+  baseDelayMs: POLL_INTERVAL_MS,
+  maxDelayMs: POLL_BACKOFF_MAX_MS,
+  quietMs: POLL_QUIET_MS,
+});
+
 async function pollAndPushMessages() {
   if (!myId) return;
   // Without a channel AND without a resolvable session there is nowhere to deliver, so the message
   // stays queued for check_messages. That is the only remaining case where a message waits to be
   // asked for.
   if (!clientRendersChannel() && sessionPid === null) return;
+  // Serving out a backoff window from an earlier failure.
+  if (!pollBackoff.ready(Date.now())) return;
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    // Reached the broker, so an outage that was reported earlier is now over.
+    // Said once, then the loop goes quiet again.
+    const recovered = pollBackoff.noteSuccess(Date.now());
+    if (recovered) log(recovered);
     const fresh = result.messages.filter((m) => !pushedMessageIds.has(m.id));
 
     for (const msg of fresh) {
@@ -572,8 +698,14 @@ async function pollAndPushMessages() {
       await ackMessages([msg.id]);
     }
   } catch (e) {
-    // Broker might be down temporarily, don't crash
-    log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+    // Broker might be down temporarily, don't crash. The failure also backs the
+    // loop off and rate limits this line: an unreachable broker used to write
+    // one line a second into the session's MCP log file, indefinitely. It is
+    // still reported the first time, on any change of error, and periodically
+    // for as long as it lasts, because a session that cannot reach its broker
+    // is broken and silence would hide that.
+    const line = pollBackoff.noteFailure(e instanceof Error ? e.message : String(e), Date.now());
+    if (line) log(line);
   }
 }
 
@@ -586,11 +718,11 @@ async function main() {
   // 2. Gather context
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
-  const tty = getTty();
+  myTty = getTty();
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
-  log(`TTY: ${tty ?? "(unknown)"}`);
+  log(`TTY: ${myTty ?? "(unknown)"}`);
 
   // 3. Generate initial summary via Claude (non-blocking, best-effort)
   let initialSummary = "";
@@ -606,6 +738,7 @@ async function main() {
       });
       if (summary) {
         initialSummary = summary;
+        mySummary = summary;
         log(`Auto-summary: ${summary}`);
       }
     } catch (e) {
@@ -617,13 +750,7 @@ async function main() {
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
   // 4. Register with broker
-  const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
-    cwd: myCwd,
-    git_root: myGitRoot,
-    tty,
-    summary: initialSummary,
-  });
+  const reg = await registerWithBroker();
   myId = reg.id;
   myToken = reg.token;
   log(`Registered as peer ${myId}`);

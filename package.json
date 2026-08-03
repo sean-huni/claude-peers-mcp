@@ -1,6 +1,6 @@
 {
   "name": "claude-peers",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Peer discovery and messaging for Claude Code instances",
   "module": "index.ts",
   "type": "module",
@@ -9,6 +9,7 @@
   "scripts": {
     "broker": "bun broker.ts",
     "server": "bun server.ts",
+    "bench": "bun bench/delivery-latency.ts",
     "test": "bun test"
   },
   "devDependencies": {

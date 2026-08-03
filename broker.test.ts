@@ -9,11 +9,22 @@
  */
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { statSync, rmSync } from "node:fs";
+import { statSync } from "node:fs";
+import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import {
+  cleanupAll,
+  reserveFreePort,
+  sweepBrokerOnPort,
+  trackProcess,
+  trackedTempDir,
+} from "./testsupport";
 
-const PORT = 7920 + Math.floor(Math.random() * 40);
-const DB = `${process.env.TMPDIR ?? "/tmp"}/claude-peers-test-${PORT}.db`;
+const PORT = reserveFreePort();
+// The database lives inside the tracked directory so one removal takes the -wal and -shm files
+// with it, rather than three deletions that have to name every suffix correctly.
+const WORK = trackedTempDir("peers-brokertest-");
+const DB = join(WORK, "broker.db");
 const BASE = `http://127.0.0.1:${PORT}`;
 
 let broker: ReturnType<typeof Bun.spawn>;
@@ -42,11 +53,8 @@ function rawPost(path: string, body: unknown, token?: string) {
 
 // The broker evicts any prior peer sharing a pid, so each test peer needs its
 // own live process. Real pids matter: peers whose process is gone get reaped.
-const holders: ReturnType<typeof Bun.spawn>[] = [];
 function livePid(): number {
-  const p = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
-  holders.push(p);
-  return p.pid;
+  return trackProcess(Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" })).pid;
 }
 
 function register(cwd: string, gitRoot: string | null = null) {
@@ -66,13 +74,13 @@ const ack = (peer_id: string, message_ids: number[], token: string) =>
   post<{ ok: boolean; acked: number }>("/ack-messages", { peer_id, message_ids }, token);
 
 beforeAll(async () => {
-  for (const suffix of ["", "-wal", "-shm"]) rmSync(`${DB}${suffix}`, { force: true });
-
-  broker = Bun.spawn(["bun", `${import.meta.dir}/broker.ts`], {
-    env: { ...process.env, CLAUDE_PEERS_PORT: String(PORT), CLAUDE_PEERS_DB: DB },
-    stdout: "ignore",
-    stderr: "ignore",
-  });
+  broker = trackProcess(
+    Bun.spawn(["bun", `${import.meta.dir}/broker.ts`], {
+      env: { ...process.env, CLAUDE_PEERS_PORT: String(PORT), CLAUDE_PEERS_DB: DB },
+      stdout: "ignore",
+      stderr: "ignore",
+    })
+  );
 
   for (let i = 0; i < 40; i++) {
     await Bun.sleep(100);
@@ -85,10 +93,14 @@ beforeAll(async () => {
   throw new Error(`broker did not come up on ${PORT}`);
 });
 
+// Unconditional: this runs after a passing suite, a failing assertion and a throwing beforeAll
+// alike, and each step is isolated so an early failure cannot skip the ones after it.
 afterAll(() => {
-  for (const h of holders) h.kill();
-  broker?.kill();
-  for (const suffix of ["", "-wal", "-shm"]) rmSync(`${DB}${suffix}`, { force: true });
+  try {
+    cleanupAll();
+  } finally {
+    sweepBrokerOnPort(PORT);
+  }
 });
 
 test("a registered peer is discoverable and excludes itself", async () => {
@@ -232,4 +244,50 @@ test("registration mints a high entropy token", async () => {
   expect(a.token).toMatch(/^[0-9a-f]{64}$/); // 256 bits, hex
   const b = await register("/tmp/entropy-2");
   expect(b.token).not.toBe(a.token);
+});
+
+test("list_peers never exposes another peer's auth token", async () => {
+  // The token is the whole authentication story. Publishing it on an
+  // authenticated route is worthless, because /register is unauthenticated by
+  // design, so anyone can obtain a token and then harvest everyone else's.
+  const victim = await register("/tmp/token-victim");
+  const observer = await register("/tmp/token-observer");
+
+  const listing = await post<Record<string, unknown>[]>(
+    "/list-peers",
+    { scope: "machine", cwd: "/tmp", git_root: null, exclude_id: observer.id },
+    observer.token
+  );
+
+  expect(listing.length).toBeGreaterThan(0);
+  for (const peer of listing) {
+    expect(Object.keys(peer)).not.toContain("token");
+  }
+  expect(JSON.stringify(listing)).not.toContain(victim.token);
+});
+
+test("registration cannot evict a live peer by claiming its pid", async () => {
+  // /register takes no credential and pid is caller-supplied, so an attacker
+  // who reads a pid from list_peers must not be able to unregister that
+  // session out from under it.
+  const victimPid = livePid();
+  const victim = await post<{ id: string; token: string }>("/register", {
+    pid: victimPid,
+    cwd: "/tmp/evict-victim",
+    git_root: null,
+    tty: null,
+    summary: "",
+  });
+
+  await post("/register", {
+    pid: victimPid, // same pid, no credential
+    cwd: "/tmp/attacker",
+    git_root: null,
+    tty: null,
+    summary: "",
+  });
+
+  // The victim is still authenticated and still addressable.
+  const stillAlive = await rawPost("/heartbeat", { id: victim.id }, victim.token);
+  expect(stillAlive.status).toBe(200);
 });

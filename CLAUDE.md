@@ -29,6 +29,7 @@ claude --dangerously-load-development-channels server:claude-peers
 bun cli.ts status
 bun cli.ts peers
 bun cli.ts send <peer-id> <message>
+bun cli.ts broadcast <message>
 bun cli.ts kill-broker
 ```
 

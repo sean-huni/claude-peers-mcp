@@ -59,6 +59,28 @@ export interface SendMessageRequest {
   text: string;
 }
 
+/**
+ * One message to every peer the scope selects, the sender excluded.
+ *
+ * Carries the same cwd and git_root as ListPeersRequest because recipients are resolved by the
+ * same selection: a broadcast's audience is exactly the peers list_peers would have returned.
+ */
+export interface BroadcastMessageRequest {
+  from_id: PeerId;
+  text: string;
+  // Omitted means "machine": the widest scope, and the one a caller who did not think about scope
+  // almost certainly meant.
+  scope?: "machine" | "directory" | "repo";
+  cwd: string;
+  git_root: string | null;
+}
+
+export interface BroadcastMessageResponse {
+  ok: boolean;
+  // Zero is a success, not an error. Nobody listening is an ordinary state.
+  delivered_to: number;
+}
+
 export interface PollMessagesRequest {
   id: PeerId;
 }

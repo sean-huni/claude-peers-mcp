@@ -9,22 +9,53 @@
  */
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
-import { rmSync, mkdtempSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import {
+  cleanupAll,
+  reserveFreePort,
+  sweepBrokerOnPort,
+  trackProcess,
+  trackedTempDir,
+} from "./testsupport";
 
-const PORT = 7961 + Math.floor(Math.random() * 30);
-const DB = `${process.env.TMPDIR ?? "/tmp"}/claude-peers-servertest-${PORT}.db`;
-const ENV = { ...process.env, CLAUDE_PEERS_PORT: String(PORT), CLAUDE_PEERS_DB: DB };
+const PORT = reserveFreePort();
+const WORK = trackedTempDir("peers-servertest-");
+const DB = join(WORK, "broker.db");
+const ENV = {
+  ...process.env,
+  CLAUDE_PEERS_PORT: String(PORT),
+  CLAUDE_PEERS_DB: DB,
+  // Never the real one under $HOME. Without this the servers spawned here resolve a session pid by
+  // walking their own process tree, land on the developer's live Claude Code session, and spool
+  // test traffic into a queue a hook is actively draining into someone's context.
+  CLAUDE_PEERS_SPOOL_DIR: join(WORK, "spool"),
+};
 
 const clients: { proc: ReturnType<typeof Bun.spawn> }[] = [];
 
-function spawnClient(cwd: string, withChannel: boolean) {
-  const proc = Bun.spawn(["bun", `${import.meta.dir}/server.ts`], {
-    cwd,
-    env: ENV,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "ignore",
-  });
+/**
+ * Each client is told which session it belongs to instead of deriving one.
+ *
+ * Derivation finds the ancestor Claude Code session, which every client here shares, so they all
+ * spool into ONE queue and drain each other's messages. Pointing each at a live process of its own
+ * gives every client the isolated queue a real session has.
+ */
+function spawnClient(cwd: string, withChannel: boolean, channelMode?: string) {
+  const session = trackProcess(Bun.spawn(["sleep", "600"], { stdout: "ignore", stderr: "ignore" }));
+  const env = {
+    ...ENV,
+    CLAUDE_PEERS_SESSION_PID: String(session.pid),
+    ...(channelMode ? { CLAUDE_PEERS_CHANNEL: channelMode } : {}),
+  };
+  const proc = trackProcess(
+    Bun.spawn(["bun", `${import.meta.dir}/server.ts`], {
+      cwd,
+      env,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "ignore",
+    })
+  );
 
   const replies = new Map<number, any>();
   const notifications: any[] = [];
@@ -99,25 +130,24 @@ function peerIdAt(listing: string, cwd: string): string {
 
 /** Each client gets its own directory so it is addressable unambiguously. */
 function workdir(): string {
-  // realpath matters: TMPDIR is a symlink on macOS (/var -> /private/var) and
-  // may carry a trailing slash, so the raw path never matches the cwd the
-  // server reports back through list_peers.
-  return realpathSync(mkdtempSync(`${(process.env.TMPDIR ?? "/tmp").replace(/\/$/, "")}/peers-test-`));
+  // Tracked, so it is removed at the end of the run. These used to accumulate: roughly ten per run,
+  // for as long as anyone had been running the suite.
+  return trackedTempDir("peers-test-");
 }
 
 let broker: ReturnType<typeof Bun.spawn>;
 
 beforeAll(async () => {
-  for (const suffix of ["", "-wal", "-shm"]) rmSync(`${DB}${suffix}`, { force: true });
-
   // Start the broker here rather than letting the first server auto-spawn it.
   // A detached grandchild does not settle reliably inside the test runner, and
   // every client then blocks waiting for a broker that never answers.
-  broker = Bun.spawn(["bun", `${import.meta.dir}/broker.ts`], {
-    env: ENV,
-    stdout: "ignore",
-    stderr: "ignore",
-  });
+  broker = trackProcess(
+    Bun.spawn(["bun", `${import.meta.dir}/broker.ts`], {
+      env: ENV,
+      stdout: "ignore",
+      stderr: "ignore",
+    })
+  );
   for (let i = 0; i < 40; i++) {
     await Bun.sleep(100);
     try {
@@ -129,16 +159,17 @@ beforeAll(async () => {
   throw new Error(`broker did not come up on ${PORT}`);
 });
 
-afterAll(async () => {
-  for (const c of clients) c.proc.kill();
-  broker?.kill();
+// Unconditional: this runs after a passing suite, a failing assertion and a throwing beforeAll
+// alike, and each step is isolated so an early failure cannot skip the ones after it.
+//
+// The sweep is NOT `lsof -ti :PORT | xargs kill`, which was here before: that signals every process
+// holding a socket on the port, and once Bun has pooled a connection the test runner is one of them.
+afterAll(() => {
   try {
-    await fetch(`http://127.0.0.1:${PORT}/health`).then((r) => r.text());
-  } catch {
-    // broker already gone
+    cleanupAll();
+  } finally {
+    sweepBrokerOnPort(PORT);
   }
-  Bun.spawnSync(["sh", "-c", `lsof -ti :${PORT} | xargs kill`]);
-  for (const suffix of ["", "-wal", "-shm"]) rmSync(`${DB}${suffix}`, { force: true });
 });
 
 test("a client that cannot render channel notifications still receives messages", async () => {
@@ -181,12 +212,14 @@ test("check_messages acknowledges, so a message is not returned twice", async ()
   expect(await receiver.tool(3, "check_messages")).toContain("No new messages");
 }, 30_000);
 
-test("a channel-capable client is still pushed to immediately", async () => {
-  // The capability gate must not cost the fast path its push.
+test("a channel-enabled session is still pushed to immediately", async () => {
+  // The gate must not cost the fast path its push. Note the signal is the
+  // session's channel mode, NOT an advertised client capability: Claude Code
+  // never advertises one.
   const senderDir = workdir();
   const receiverDir = workdir();
   const sender = spawnClient(senderDir, false);
-  const receiver = spawnClient(receiverDir, true);
+  const receiver = spawnClient(receiverDir, false, "always");
 
   await sender.initialize(1);
   await receiver.initialize(1);
@@ -199,4 +232,46 @@ test("a channel-capable client is still pushed to immediately", async () => {
   const pushed = receiver.notifications.filter((n) => String(n.method).includes("channel"));
   expect(pushed.length).toBeGreaterThan(0);
   expect(JSON.stringify(pushed[0].params)).toContain("pushed over the channel");
+}, 30_000);
+
+test("a real Claude Code client is pushed to, despite advertising no experimental capability", async () => {
+  // The production shape. Claude Code's initialize frame carries only
+  // {roots, elicitation}: it never advertises experimental["claude/channel"],
+  // even when launched with --dangerously-load-development-channels. Gating the
+  // push on that capability therefore disabled instant delivery for every real
+  // session while the tests, which invented the capability, stayed green.
+  const senderDir = workdir();
+  const receiverDir = workdir();
+  const sender = spawnClient(senderDir, false);
+  const receiver = spawnClient(receiverDir, false, "always"); // advertises nothing
+
+  await sender.initialize(1);
+  await receiver.initialize(1);
+  await Bun.sleep(3000);
+
+  const target = peerIdAt(await sender.tool(2, "list_peers", { scope: "machine" }), receiverDir);
+  await sender.tool(3, "send_message", { to_id: target, message: "pushed without advertising" });
+  await Bun.sleep(2500);
+
+  const pushed = receiver.notifications.filter((n) => String(n.method).includes("channel"));
+  expect(pushed.length).toBeGreaterThan(0);
+  expect(JSON.stringify(pushed[0].params)).toContain("pushed without advertising");
+}, 30_000);
+
+test("channel mode never falls back to check_messages", async () => {
+  const senderDir = workdir();
+  const receiverDir = workdir();
+  const sender = spawnClient(senderDir, false);
+  const receiver = spawnClient(receiverDir, true, "never"); // advertises, but disabled
+
+  await sender.initialize(1);
+  await receiver.initialize(1);
+  await Bun.sleep(3000);
+
+  const target = peerIdAt(await sender.tool(2, "list_peers", { scope: "machine" }), receiverDir);
+  await sender.tool(3, "send_message", { to_id: target, message: "queued not pushed" });
+  await Bun.sleep(2500);
+
+  expect(receiver.notifications.filter((n) => String(n.method).includes("channel"))).toHaveLength(0);
+  expect(await receiver.tool(2, "check_messages")).toContain("queued not pushed");
 }, 30_000);

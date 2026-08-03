@@ -8,6 +8,7 @@
  *   bun cli.ts status          Show broker status and all peers
  *   bun cli.ts peers           List all peers
  *   bun cli.ts send <id> <msg> Send a message to a peer
+ *   bun cli.ts broadcast <msg> Send a message to every peer on the machine
  *   bun cli.ts inbox           Drain messages spooled for THIS session (used by the hook)
  *   bun cli.ts kill-broker     Stop the broker daemon
  */
@@ -193,6 +194,35 @@ switch (cmd) {
   }
 
   /**
+   * Send one message to every session on the machine.
+   *
+   * Machine scope only, deliberately: the transient CLI peer registers with cwd of wherever the
+   * command was typed and no git root, so a directory or repo scope here would select on this
+   * shell's location rather than on anything the operator meant.
+   */
+  case "broadcast": {
+    const msg = process.argv.slice(3).join(" ");
+    if (!msg) {
+      console.error("Usage: bun cli.ts broadcast <message>");
+      process.exit(1);
+    }
+    try {
+      const result = await brokerFetch<{ ok: boolean; delivered_to: number }>("/broadcast-message", {
+        from_id: cliPeerId,
+        text: msg,
+        scope: "machine",
+        cwd: process.cwd(),
+        git_root: null,
+      });
+      // Zero is not a failure, so it is reported rather than treated as an error.
+      console.log(`Broadcast delivered to ${result.delivered_to} peer(s).`);
+    } catch (e) {
+      console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    break;
+  }
+
+  /**
    * Drain whatever was spooled for the session this command is running inside.
    *
    * Exists for the Claude Code hook, which is what makes delivery automatic when the channel is
@@ -256,6 +286,7 @@ Usage:
   bun cli.ts status          Show broker status and all peers
   bun cli.ts peers           List all peers
   bun cli.ts send <id> <msg> Send a message to a peer
+  bun cli.ts broadcast <msg> Send a message to every peer on the machine
   bun cli.ts kill-broker     Stop the broker daemon`);
 }
 

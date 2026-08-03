@@ -23,6 +23,7 @@ import type {
   PeerId,
   Peer,
   RegisterResponse,
+  BroadcastMessageResponse,
   PollMessagesResponse,
   Message,
 } from "./shared/types.ts";
@@ -90,6 +91,7 @@ const CALLER_FIELD: Record<string, string> = {
   "/set-summary": "id",
   "/list-peers": "exclude_id",
   "/send-message": "from_id",
+  "/broadcast-message": "from_id",
   "/poll-messages": "id",
   "/ack-messages": "peer_id",
   "/unregister": "id",
@@ -294,6 +296,7 @@ Read the from_id, from_summary, and from_cwd attributes to understand who sent t
 Available tools:
 - list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
 - send_message: Send a message to another instance by ID
+- broadcast_message: Send one message to every other instance in scope, for news that concerns them all. Prefer send_message whenever one peer is the audience.
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
 
@@ -338,6 +341,37 @@ const TOOLS = [
         },
       },
       required: ["to_id", "message"],
+    },
+  },
+  {
+    name: "broadcast_message",
+    description:
+      "Send one message to EVERY other Claude Code instance in scope at once. You are never sent " +
+      "your own broadcast. Use this only when the information genuinely concerns every session: a " +
+      "shared contract or schema changed, a shared branch moved, a shared resource is down, or you " +
+      "are about to do something that would disrupt others. Anything addressed to one peer, " +
+      "including a reply, a question or a status answer, must use send_message instead: every " +
+      "broadcast interrupts every other session, so an unnecessary one is pure noise for people " +
+      "working on something else. If you are unsure who needs to know, call list_peers and " +
+      "send_message the ones who do.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        message: {
+          type: "string" as const,
+          description: "The message to send to every peer in scope",
+        },
+        scope: {
+          type: "string" as const,
+          enum: ["machine", "directory", "repo"],
+          description:
+            'Who receives it, mirroring list_peers. "machine" (default) = every instance on this ' +
+            'computer. "directory" = instances in the same working directory. "repo" = instances ' +
+            "in the same git repository, including worktrees and subdirectories. Prefer the " +
+            "narrowest scope that reaches the people who need to know.",
+        },
+      },
+      required: ["message"],
     },
   },
   {
@@ -460,6 +494,58 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               type: "text" as const,
               text: `Error sending message: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "broadcast_message": {
+      const { message, scope = "machine" } = args as {
+        message: string;
+        scope?: "machine" | "directory" | "repo";
+      };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<BroadcastMessageResponse>("/broadcast-message", {
+          from_id: myId,
+          text: message,
+          scope,
+          cwd: myCwd,
+          git_root: myGitRoot,
+        });
+        // Reaching nobody is reported plainly rather than as a failure: being the only session in
+        // scope is an ordinary state, and an error here would invite a pointless retry.
+        if (result.delivered_to === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Broadcast delivered to 0 peer(s) (scope: ${scope}). No other instances are in scope.`,
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Broadcast delivered to ${result.delivered_to} peer(s) (scope: ${scope}).`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error broadcasting message: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
           isError: true,

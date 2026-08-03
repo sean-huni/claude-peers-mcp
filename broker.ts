@@ -19,6 +19,8 @@ import type {
   SetSummaryRequest,
   ListPeersRequest,
   SendMessageRequest,
+  BroadcastMessageRequest,
+  BroadcastMessageResponse,
   PollMessagesRequest,
   PollMessagesResponse,
   Peer,
@@ -536,7 +538,14 @@ function handleSetSummary(body: SetSummaryRequest): void {
   stmts.updateSummary.run(body.summary, body.id);
 }
 
-function handleListPeers(body: ListPeersRequest): Peer[] {
+/**
+ * The peers a scope selects, minus the caller, minus anything whose process has died.
+ *
+ * Shared by /list-peers and /broadcast-message so a broadcast's audience is exactly the peers the
+ * caller would have been shown. Two copies of this would be two definitions of "peer", and the one
+ * nobody looked at would be the one messages went to.
+ */
+function selectPeers(body: ListPeersRequest): Peer[] {
   let peers: Peer[];
 
   switch (body.scope) {
@@ -571,6 +580,10 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   });
 }
 
+function handleListPeers(body: ListPeersRequest): Peer[] {
+  return selectPeers(body);
+}
+
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
   // Verify target exists
   const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
@@ -580,6 +593,39 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 
   stmts.insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
   return { ok: true };
+}
+
+/**
+ * Fan out one message to every peer the scope selects, the sender excluded.
+ *
+ * Fan-out on WRITE: one row per recipient, so every mechanism already built for unicast applies
+ * unchanged (per-peer acknowledgement, the TTL sweep, the channel gate, the spool fallback). Fan-out
+ * on read would need a cursor table, new acknowledgement semantics and a second delivery path, all
+ * to serve the two to five sessions that exist on one machine.
+ *
+ * The insert is one transaction, so a failure part way through leaves no half-delivered broadcast.
+ * AFTERWARDS the copies are independent by design: each is acked, reaped and expired on its own,
+ * exactly like a unicast, so a dead peer's copy being swept cannot disturb anybody else's.
+ *
+ * Zero recipients is a success. Being the only session in a directory is ordinary, and reporting it
+ * as an error would make the tool cry wolf.
+ */
+function handleBroadcastMessage(body: BroadcastMessageRequest): BroadcastMessageResponse {
+  const recipients = selectPeers({
+    scope: body.scope ?? "machine",
+    cwd: body.cwd,
+    git_root: body.git_root,
+    exclude_id: body.from_id,
+  });
+
+  const sentAt = new Date().toISOString();
+  db.transaction(() => {
+    for (const peer of recipients) {
+      stmts.insertMessage.run(body.from_id, peer.id, body.text, sentAt);
+    }
+  })();
+
+  return { ok: true, delivered_to: recipients.length };
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
@@ -623,6 +669,9 @@ const CALLER_FIELD: Record<string, string> = {
   "/set-summary": "id",
   "/list-peers": "exclude_id",
   "/send-message": "from_id",
+  // Unauthenticated this would be the loudest route in the system: one call injecting a message
+  // into every session on the machine at once.
+  "/broadcast-message": "from_id",
   "/poll-messages": "id",
   "/ack-messages": "peer_id",
   "/unregister": "id",
@@ -681,6 +730,8 @@ function dispatch(req: Request, path: string, body: unknown): Response {
       return Response.json(handleListPeers(body as ListPeersRequest));
     case "/send-message":
       return Response.json(handleSendMessage(body as SendMessageRequest));
+    case "/broadcast-message":
+      return Response.json(handleBroadcastMessage(body as BroadcastMessageRequest));
     case "/poll-messages":
       return Response.json(handlePollMessages(body as PollMessagesRequest));
     case "/ack-messages":

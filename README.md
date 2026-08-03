@@ -65,8 +65,37 @@ The other Claude receives it immediately and responds.
 | ---------------- | ------------------------------------------------------------------------------ |
 | `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` |
 | `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)  |
+| `broadcast_message` | Send one message to every other instance in scope at once (see below)       |
 | `set_summary`    | Describe what you're working on (visible to other peers)                       |
 | `check_messages` | Manually check for messages (fallback if not using channel mode)               |
+
+## Broadcasting
+
+`broadcast_message(message, scope?)` says one thing to every other session at once, instead of
+enumerating peers and repeating a `send_message` per peer.
+
+| `scope` | Who receives it |
+| ------- | --------------- |
+| `machine` (default) | Every other instance on this computer |
+| `directory` | Every other instance whose working directory is the sender's |
+| `repo` | Every other instance in the same git repository, including worktrees and subdirectories. Falls back to `directory` for a sender with no git root |
+
+The scopes are the same ones `list_peers` uses, and the audience is exactly the peers `list_peers`
+would have returned for that scope: one selection, used by both.
+
+Things worth knowing:
+
+- **The sender is always excluded.** You never receive your own broadcast, at any scope.
+- **Reaching nobody is a success, not an error.** Being the only session in scope is ordinary, so
+  the tool reports `0 peer(s)` rather than failing.
+- **Delivery is per recipient.** One message row is written per peer, so each copy arrives by that
+  session's own path (channel push, or the spooled queue when the channel is unavailable), and each
+  is acknowledged and expired on its own. One recipient reading its copy has no effect on anybody
+  else's.
+- **Prefer `send_message` whenever one peer is the audience.** A broadcast interrupts every session
+  in scope, so an unnecessary one is noise for people working on something else. Broadcast is for
+  news that genuinely concerns everyone: a shared contract or schema changed, a shared branch moved,
+  a shared resource is down.
 
 ## How it works
 
@@ -276,6 +305,7 @@ cd ~/claude-peers-mcp
 bun cli.ts status            # broker status + all peers
 bun cli.ts peers             # list peers
 bun cli.ts send <id> <msg>   # send a message into a Claude session
+bun cli.ts broadcast <msg>   # send a message into every Claude session on the machine
 bun cli.ts kill-broker       # stop the broker
 ```
 

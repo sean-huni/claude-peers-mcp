@@ -19,6 +19,8 @@ import type {
   SetSummaryRequest,
   ListPeersRequest,
   SendMessageRequest,
+  BroadcastMessageRequest,
+  BroadcastMessageResponse,
   PollMessagesRequest,
   PollMessagesResponse,
   Peer,
@@ -33,6 +35,13 @@ const MSG_TTL_MS = parseInt(process.env.CLAUDE_PEERS_MSG_TTL ?? "3600000", 10);
 // How long after a delete the write-ahead log is checkpointed away. See
 // scheduleCheckpoint below for why this is a debounce rather than immediate.
 const CHECKPOINT_MS = parseInt(process.env.CLAUDE_PEERS_CHECKPOINT_MS ?? "1000", 10);
+// The push transport. Off makes /subscribe a 404, which is exactly what a client sees when it
+// talks to a broker predating this, so the degraded path is reachable without an old binary.
+const SSE_ENABLED = (process.env.CLAUDE_PEERS_SSE ?? "on") !== "off";
+// Comment frames down an idle stream. Nothing on loopback needs them to stay alive, but they are
+// what turns a half-open connection into a write error, which is how a subscriber that has gone
+// away without a FIN gets reaped.
+const SSE_KEEPALIVE_MS = parseInt(process.env.CLAUDE_PEERS_SSE_KEEPALIVE_MS ?? "25000", 10);
 
 // --- Database setup ---
 
@@ -285,12 +294,121 @@ function periodic(fn: () => void): () => void {
   };
 }
 
+// --- Push transport: the subscriber registry ---
+//
+// Each registered peer may hold one server-sent-events connection, and an insert into its mailbox
+// wakes it. That replaces the client asking every second whether anything has happened, which was
+// the whole of the broker-to-server hop: about 86,400 requests a session a day, nearly all of them
+// answering "nothing".
+//
+// The frame carries no message text, only the fact that there is mail. The client then runs the
+// delivery it already had, so there is exactly one path that renders a message and one that
+// acknowledges it, and the stream cannot deliver something the poll would deliver again. It also
+// keeps message text out of a transport with no acknowledgement: a frame written into a socket
+// nobody reads is lost, and losing a wake-up costs a second of latency, while losing the only copy
+// of a message costs the message.
+
+interface Subscriber {
+  peerId: string;
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  closed: boolean;
+}
+
+const subscribers = new Map<string, Set<Subscriber>>();
+const encoder = new TextEncoder();
+
+function subscriberCount(): number {
+  let n = 0;
+  for (const set of subscribers.values()) n += set.size;
+  return n;
+}
+
+function addSubscriber(sub: Subscriber): void {
+  let set = subscribers.get(sub.peerId);
+  if (!set) {
+    set = new Set();
+    subscribers.set(sub.peerId, set);
+  }
+  set.add(sub);
+}
+
+/**
+ * Forget a subscriber and close its stream.
+ *
+ * Idempotent by design: a disconnect can be observed twice, once by the request's abort signal and
+ * once by the stream being cancelled, and the second observation must be free rather than an
+ * error. The empty set is deleted rather than left behind, so a broker that has served thousands
+ * of short sessions does not accumulate a key per peer id it has ever seen.
+ */
+function removeSubscriber(sub: Subscriber): void {
+  if (sub.closed) return;
+  sub.closed = true;
+  const set = subscribers.get(sub.peerId);
+  if (set) {
+    set.delete(sub);
+    if (set.size === 0) subscribers.delete(sub.peerId);
+  }
+  try {
+    sub.controller.close();
+  } catch {
+    // Already closed by the runtime when the socket went away.
+  }
+}
+
+/** Write one frame, dropping the subscriber if the socket no longer accepts it. */
+function send(sub: Subscriber, frame: string): void {
+  if (sub.closed) return;
+  try {
+    sub.controller.enqueue(encoder.encode(frame));
+  } catch {
+    removeSubscriber(sub);
+  }
+}
+
+/**
+ * Tell a peer that its mailbox changed.
+ *
+ * Called from the statement wrapper below rather than from a route handler, so every insert
+ * notifies, including ones made by routes that do not exist yet.
+ */
+function notifyMailbox(peerId: string): void {
+  const set = subscribers.get(peerId);
+  if (!set) return;
+  for (const sub of [...set]) send(sub, "event: message\ndata: {}\n\n");
+}
+
+/** Close every stream belonging to a peer that no longer exists. */
+function closeSubscribers(peerId: string): void {
+  const set = subscribers.get(peerId);
+  if (!set) return;
+  for (const sub of [...set]) removeSubscriber(sub);
+}
+
+if (SSE_ENABLED && SSE_KEEPALIVE_MS > 0) {
+  const timer = setInterval(() => {
+    for (const set of [...subscribers.values()]) {
+      for (const sub of [...set]) send(sub, ": keepalive\n\n");
+    }
+  }, SSE_KEEPALIVE_MS);
+  // A keepalive is never a reason to keep the process alive.
+  timer.unref?.();
+}
+
 // --- Prepared statements ---
 //
 // Rebuilt whenever the database is reopened: a statement is bound to the handle
 // that prepared it, so a stale one keeps failing against the dead file.
 
 function prepareStatements() {
+  const insertMessage = db.prepare(`
+    INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
+    VALUES (?, ?, ?, ?, 0)
+  `);
+
+  const deletePeer = db.prepare(`
+    DELETE FROM peers WHERE id = ?
+  `);
+
   return {
     insertPeer: db.prepare(`
       INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen, token)
@@ -309,9 +427,16 @@ function prepareStatements() {
       UPDATE peers SET summary = ? WHERE id = ?
     `),
 
-    deletePeer: db.prepare(`
-      DELETE FROM peers WHERE id = ?
-    `),
+    // Wrapped rather than exposed raw, so every caller that removes a peer also drops its streams.
+    // A stream for an id the broker has forgotten can never carry anything again; left open it is
+    // a descriptor and a controller held for nobody.
+    deletePeer: {
+      run(id: string) {
+        const changes = deletePeer.run(id);
+        if (changes.changes > 0) closeSubscribers(id);
+        return changes;
+      },
+    },
 
     // Never SELECT * here: the row carries the auth token, and these results are
     // serialised straight to any caller. Project the public columns only.
@@ -327,10 +452,20 @@ function prepareStatements() {
       SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen FROM peers WHERE git_root = ?
     `),
 
-    insertMessage: db.prepare(`
-      INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
-      VALUES (?, ?, ?, ?, 0)
-    `),
+    // THE NOTIFICATION HOOK. Wrapping the statement rather than calling notifyMailbox from
+    // /send-message puts the push at the point where a mailbox actually changes, so a route added
+    // later (a broadcast writing one row per recipient, say) wakes its recipients without knowing
+    // this transport exists, and cannot forget to.
+    //
+    // Safe inside a transaction: the frame is enqueued into a stream the runtime flushes after the
+    // current synchronous work, so the client's follow-up poll cannot run before the commit.
+    insertMessage: {
+      run(fromId: string, toId: string, text: string, sentAt: string) {
+        const changes = insertMessage.run(fromId, toId, text, sentAt);
+        notifyMailbox(toId);
+        return changes;
+      },
+    },
 
     selectUndelivered: db.prepare(`
       SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
@@ -403,7 +538,14 @@ function handleSetSummary(body: SetSummaryRequest): void {
   stmts.updateSummary.run(body.summary, body.id);
 }
 
-function handleListPeers(body: ListPeersRequest): Peer[] {
+/**
+ * The peers a scope selects, minus the caller, minus anything whose process has died.
+ *
+ * Shared by /list-peers and /broadcast-message so a broadcast's audience is exactly the peers the
+ * caller would have been shown. Two copies of this would be two definitions of "peer", and the one
+ * nobody looked at would be the one messages went to.
+ */
+function selectPeers(body: ListPeersRequest): Peer[] {
   let peers: Peer[];
 
   switch (body.scope) {
@@ -438,6 +580,10 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   });
 }
 
+function handleListPeers(body: ListPeersRequest): Peer[] {
+  return selectPeers(body);
+}
+
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
   // Verify target exists
   const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
@@ -447,6 +593,39 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 
   stmts.insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
   return { ok: true };
+}
+
+/**
+ * Fan out one message to every peer the scope selects, the sender excluded.
+ *
+ * Fan-out on WRITE: one row per recipient, so every mechanism already built for unicast applies
+ * unchanged (per-peer acknowledgement, the TTL sweep, the channel gate, the spool fallback). Fan-out
+ * on read would need a cursor table, new acknowledgement semantics and a second delivery path, all
+ * to serve the two to five sessions that exist on one machine.
+ *
+ * The insert is one transaction, so a failure part way through leaves no half-delivered broadcast.
+ * AFTERWARDS the copies are independent by design: each is acked, reaped and expired on its own,
+ * exactly like a unicast, so a dead peer's copy being swept cannot disturb anybody else's.
+ *
+ * Zero recipients is a success. Being the only session in a directory is ordinary, and reporting it
+ * as an error would make the tool cry wolf.
+ */
+function handleBroadcastMessage(body: BroadcastMessageRequest): BroadcastMessageResponse {
+  const recipients = selectPeers({
+    scope: body.scope ?? "machine",
+    cwd: body.cwd,
+    git_root: body.git_root,
+    exclude_id: body.from_id,
+  });
+
+  const sentAt = new Date().toISOString();
+  db.transaction(() => {
+    for (const peer of recipients) {
+      stmts.insertMessage.run(body.from_id, peer.id, body.text, sentAt);
+    }
+  })();
+
+  return { ok: true, delivered_to: recipients.length };
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
@@ -490,6 +669,9 @@ const CALLER_FIELD: Record<string, string> = {
   "/set-summary": "id",
   "/list-peers": "exclude_id",
   "/send-message": "from_id",
+  // Unauthenticated this would be the loudest route in the system: one call injecting a message
+  // into every session on the machine at once.
+  "/broadcast-message": "from_id",
   "/poll-messages": "id",
   "/ack-messages": "peer_id",
   "/unregister": "id",
@@ -501,11 +683,7 @@ const CALLER_FIELD: Record<string, string> = {
  * Peer ids are public via /list-peers, so the id alone proves nothing. The
  * token is 256 bits minted at registration and never leaves the owning process.
  */
-function isAuthorized(req: Request, path: string, body: Record<string, unknown>): boolean {
-  const field = CALLER_FIELD[path];
-  if (!field) return true;
-
-  const claimed = body[field];
+function ownsPeer(req: Request, claimed: unknown): boolean {
   // /list-peers may omit exclude_id; an anonymous read is still a read of every
   // session's cwd and summary, so it is refused rather than allowed through.
   if (typeof claimed !== "string" || claimed.length === 0) return false;
@@ -518,6 +696,12 @@ function isAuthorized(req: Request, path: string, body: Record<string, unknown>)
   const b = Buffer.from(row.token);
   // timingSafeEqual throws on a length mismatch, which is itself the answer.
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function isAuthorized(req: Request, path: string, body: Record<string, unknown>): boolean {
+  const field = CALLER_FIELD[path];
+  if (!field) return true;
+  return ownsPeer(req, body[field]);
 }
 
 // --- HTTP Server ---
@@ -546,6 +730,8 @@ function dispatch(req: Request, path: string, body: unknown): Response {
       return Response.json(handleListPeers(body as ListPeersRequest));
     case "/send-message":
       return Response.json(handleSendMessage(body as SendMessageRequest));
+    case "/broadcast-message":
+      return Response.json(handleBroadcastMessage(body as BroadcastMessageRequest));
     case "/poll-messages":
       return Response.json(handlePollMessages(body as PollMessagesRequest));
     case "/ack-messages":
@@ -556,6 +742,49 @@ function dispatch(req: Request, path: string, body: unknown): Response {
     default:
       return Response.json({ error: "not found" }, { status: 404 });
   }
+}
+
+/**
+ * Open an event stream for one authenticated peer.
+ *
+ * A subscription is a read of a mailbox, so it is authenticated exactly as /poll-messages is:
+ * peer ids are public via /list-peers, and an unauthenticated stream would let any local process
+ * watch another session's mail arrive.
+ */
+function handleSubscribe(req: Request, peerId: string): Response {
+  let sub: Subscriber | null = null;
+
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      sub = { peerId, controller, closed: false };
+      addSubscriber(sub);
+      // Sent before anything else so the client can tell an accepted subscription from a
+      // connection that was merely opened. Its poll interval depends on knowing the difference.
+      controller.enqueue(encoder.encode(": subscribed\n\n"));
+    },
+    cancel() {
+      if (sub) removeSubscriber(sub);
+    },
+  });
+
+  // Both, deliberately. A client that aborts its fetch and a socket that dies are the same event
+  // to this registry but not to the runtime, and only one of the two is guaranteed to be observed;
+  // removeSubscriber is idempotent so seeing both costs nothing.
+  req.signal.addEventListener("abort", () => {
+    if (sub) removeSubscriber(sub);
+  });
+
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      // Nothing proxies loopback today, but a buffering intermediary would defeat the entire
+      // point of the transport, so say so.
+      "X-Accel-Buffering": "no",
+    },
+  });
 }
 
 Bun.serve({
@@ -574,11 +803,23 @@ Bun.serve({
       if (path === "/health") {
         try {
           const peers = withDatabase(() => (stmts.selectAllPeers.all() as Peer[]).length);
-          return Response.json({ status: "ok", peers });
+          // Reported so a leak in the registry is observable from outside the process rather than
+          // only in a heap dump.
+          return Response.json({ status: "ok", peers, subscribers: subscriberCount() });
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           return Response.json({ status: "error", error: msg }, { status: 500 });
         }
+      }
+      if (path === "/subscribe") {
+        // A 404 is what a broker predating this transport returns, and what the kill switch
+        // returns, so a client cannot tell the two apart and falls back to polling for both.
+        if (!SSE_ENABLED) return Response.json({ error: "not found" }, { status: 404 });
+        const peerId = url.searchParams.get("id");
+        if (!withDatabase(() => ownsPeer(req, peerId))) {
+          return Response.json({ error: "unauthorized" }, { status: 401 });
+        }
+        return handleSubscribe(req, peerId!);
       }
       return new Response("claude-peers broker", { status: 200 });
     }

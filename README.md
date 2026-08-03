@@ -65,12 +65,41 @@ The other Claude receives it immediately and responds.
 | ---------------- | ------------------------------------------------------------------------------ |
 | `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` |
 | `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)  |
+| `broadcast_message` | Send one message to every other instance in scope at once (see below)       |
 | `set_summary`    | Describe what you're working on (visible to other peers)                       |
 | `check_messages` | Manually check for messages (fallback if not using channel mode)               |
 
+## Broadcasting
+
+`broadcast_message(message, scope?)` says one thing to every other session at once, instead of
+enumerating peers and repeating a `send_message` per peer.
+
+| `scope` | Who receives it |
+| ------- | --------------- |
+| `machine` (default) | Every other instance on this computer |
+| `directory` | Every other instance whose working directory is the sender's |
+| `repo` | Every other instance in the same git repository, including worktrees and subdirectories. Falls back to `directory` for a sender with no git root |
+
+The scopes are the same ones `list_peers` uses, and the audience is exactly the peers `list_peers`
+would have returned for that scope: one selection, used by both.
+
+Things worth knowing:
+
+- **The sender is always excluded.** You never receive your own broadcast, at any scope.
+- **Reaching nobody is a success, not an error.** Being the only session in scope is ordinary, so
+  the tool reports `0 peer(s)` rather than failing.
+- **Delivery is per recipient.** One message row is written per peer, so each copy arrives by that
+  session's own path (channel push, or the spooled queue when the channel is unavailable), and each
+  is acknowledged and expired on its own. One recipient reading its copy has no effect on anybody
+  else's.
+- **Prefer `send_message` whenever one peer is the audience.** A broadcast interrupts every session
+  in scope, so an unnecessary one is noise for people working on something else. Broadcast is for
+  news that genuinely concerns everyone: a shared contract or schema changed, a shared branch moved,
+  a shared resource is down.
+
 ## How it works
 
-A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker and polls for messages every second. Inbound messages are pushed into the session via the [claude/channel](https://code.claude.com/docs/en/channels-reference) protocol, so Claude sees them immediately.
+A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker and subscribes to it. Both hops push: the broker writes a `text/event-stream` frame the moment a message lands in a peer's mailbox, and the MCP server passes it into the session via the [claude/channel](https://code.claude.com/docs/en/channels-reference) protocol, so Claude sees it immediately.
 
 ```
                     ┌───────────────────────────┐
@@ -85,6 +114,35 @@ A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude
 ```
 
 The broker auto-launches when the first session starts. It cleans up dead peers automatically. Everything is localhost-only.
+
+### The push transport, and the poll behind it
+
+`GET /subscribe?id=<peer>` with the peer's bearer token opens an event stream. The broker notifies
+at the point a row is inserted into `messages`, so every route that queues mail wakes its recipient
+without having to remember to. The frame says only that there is something to fetch: the client
+then runs the same delivery the poll runs, which is what makes it impossible for a message to be
+rendered twice by two transports.
+
+The poll is still there. While the stream is healthy it runs every 30 seconds as an audit rather
+than as the transport; the moment the stream is gone it returns to one second, which is exactly
+what the session did before. A broker that does not serve `/subscribe` at all, an older one or one
+started with `CLAUDE_PEERS_SSE=off`, is therefore not a broker a session goes deaf against, only a
+slower one.
+
+| Variable                       | Default | What it changes                                        |
+| ------------------------------ | ------- | ------------------------------------------------------ |
+| `CLAUDE_PEERS_SSE`             | `on`    | Broker: `off` makes `/subscribe` a 404                 |
+| `CLAUDE_PEERS_STREAM`          | `on`    | Server: `off` disables subscribing, polling only       |
+| `CLAUDE_PEERS_POLL_MS`         | `1000`  | Poll interval while there is no healthy stream         |
+| `CLAUDE_PEERS_POLL_IDLE_MS`    | `30000` | Poll interval while the stream is healthy              |
+| `CLAUDE_PEERS_SSE_KEEPALIVE_MS`| `25000` | Broker: comment frames down an idle stream             |
+| `CLAUDE_PEERS_STREAM_IDLE_MS`  | `75000` | Server: silence after which a stream is presumed dead  |
+
+Measure it on your own machine with the harness, which runs unmodified against any checkout:
+
+```bash
+bun bench/send-to-render.ts --root . --port 7840 --n 30 --label after
+```
 
 ## Auto-summary
 
@@ -247,6 +305,7 @@ cd ~/claude-peers-mcp
 bun cli.ts status            # broker status + all peers
 bun cli.ts peers             # list peers
 bun cli.ts send <id> <msg>   # send a message into a Claude session
+bun cli.ts broadcast <msg>   # send a message into every Claude session on the machine
 bun cli.ts kill-broker       # stop the broker
 ```
 
@@ -258,6 +317,19 @@ bun cli.ts kill-broker       # stop the broker
 | `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
 | `ANTHROPIC_API_KEY`  | Keychain OAuth token | Auto-summary credential (optional)    |
 
+
+## Benchmarking delivery
+
+```bash
+bun run bench                                   # full run, roughly 3 to 4 minutes
+bun bench/delivery-latency.ts --json-out out.json
+```
+
+Measures send-to-render latency, burst behaviour, one-to-many latency when a `broadcast_message`
+tool exists, and the broker request volume of an idle session. It feature-detects, so the same
+harness runs unchanged on every branch, and it exits non-zero rather than reporting statistics drawn
+from messages that never arrived. Method, guards and the ways the numbers could still mislead are in
+[`bench/README.md`](bench/README.md).
 
 ## Quicker Launch
 

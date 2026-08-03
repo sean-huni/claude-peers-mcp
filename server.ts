@@ -26,6 +26,9 @@ import type {
   PollMessagesResponse,
   Message,
 } from "./shared/types.ts";
+import { fileURLToPath } from "node:url";
+import pkg from "./package.json";
+import { drainSpool, findSessionPid, spoolMessage, sweepDeadSpools } from "./spool";
 import {
   generateSummary,
   getGitBranch,
@@ -38,7 +41,12 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+// fileURLToPath, not .pathname: the latter is percent-encoded, so any install
+// directory containing a space yields a module-not-found at broker launch.
+const BROKER_SCRIPT = fileURLToPath(new URL("./broker.ts", import.meta.url));
+// Sourced from package.json so the version reported to MCP clients cannot
+// drift from the released one.
+const VERSION = (pkg as { version: string }).version;
 
 // --- Broker communication ---
 
@@ -147,7 +155,7 @@ let myGitRoot: string | null = null;
 // --- MCP Server ---
 
 const mcp = new Server(
-  { name: "claude-peers", version: "0.1.0" },
+  { name: "claude-peers", version: VERSION },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
@@ -369,15 +377,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
+        // Anything the poll loop already spooled is drained here too, so this tool keeps working
+        // exactly as it did when the hook is not installed. Without this, spooling would MOVE
+        // messages out of reach: check_messages would answer "no new messages" while they sat in a
+        // file nobody was reading, which is worse than the problem the spool solves. Caught by
+        // three existing tests, which is what they were for.
+        const spooled = sessionPid === null ? [] : drainSpool(sessionPid);
         const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-        if (result.messages.length === 0) {
+
+        if (spooled.length === 0 && result.messages.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
         }
-        const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
-        );
+
+        // Spooled first: they arrived earlier, and a conversation read out of order is not a
+        // conversation.
+        const lines = [
+          ...spooled.map((m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`),
+          ...result.messages.map((m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`),
+        ];
+        const total = spooled.length + result.messages.length;
         // Rendered to the caller, so acknowledge it. Polling no longer
         // consumes, so without this the same message is returned every time.
         await ackMessages(result.messages.map((m) => m.id));
@@ -386,7 +406,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           content: [
             {
               type: "text" as const,
-              text: `${result.messages.length} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
+              text: `${total} new message(s):\n\n${lines.join("\n\n---\n\n")}`,
             },
           ],
         };
@@ -430,24 +450,64 @@ async function ackMessages(ids: number[]): Promise<void> {
 }
 
 /**
- * Whether the client can render channel notifications.
+ * Whether this session can render channel notifications.
  *
- * Claude Code only advertises this when launched with the development-channels
- * flag. Pushing to a client that cannot render is worse than not pushing: the
- * message is acknowledged, deleted, and never seen.
+ * Claude Code does NOT advertise the channel as an MCP capability. Its
+ * initialize frame carries only {roots, elicitation}, with no experimental
+ * field, even when launched with --dangerously-load-development-channels.
+ * Gating on a client capability therefore disables push for every real
+ * session, which is exactly the bug this replaces.
+ *
+ * The flag is instead visible in the parent process's argv, where it names the
+ * servers allowed to push: `--dangerously-load-development-channels
+ * server:claude-peers`. That is the only honest signal available, so read it
+ * once at startup. CLAUDE_PEERS_CHANNEL=always|never overrides, for tests and
+ * for hosts where reading the parent is not possible.
+ *
+ * Pushing to a session that cannot render is worse than not pushing, because
+ * the message is acknowledged and deleted unseen. So when detection is
+ * genuinely impossible the safe answer is no push: the message stays queued
+ * and check_messages still delivers it.
  */
-function clientRendersChannel(): boolean {
-  const experimental = mcp.getClientCapabilities()?.experimental as
-    | Record<string, unknown>
-    | undefined;
-  return Boolean(experimental?.["claude/channel"]);
+const SERVER_NAME = "claude-peers";
+
+function detectChannelEnabled(): boolean {
+  const override = process.env.CLAUDE_PEERS_CHANNEL;
+  if (override === "always") return true;
+  if (override === "never") return false;
+
+  try {
+    const parent = Bun.spawnSync(["ps", "-o", "command=", "-p", String(process.ppid)]);
+    const argv = new TextDecoder().decode(parent.stdout);
+    if (!argv.includes("dangerously-load-development-channels")) return false;
+    // The flag lists which servers may push. Only claim the channel when this
+    // server is one of them.
+    return argv.includes(`server:${SERVER_NAME}`);
+  } catch {
+    return false;
+  }
 }
+
+const channelEnabled = detectChannelEnabled();
+
+function clientRendersChannel(): boolean {
+  return channelEnabled;
+}
+
+/**
+ * The session this server belongs to, for spooled delivery.
+ *
+ * Resolved once: the parent cannot change, and re-deriving it on every cycle would run two `ps`
+ * calls a second for the life of the session.
+ */
+const sessionPid: number | null = findSessionPid();
 
 async function pollAndPushMessages() {
   if (!myId) return;
-  // No channel means no push. The message stays queued and is delivered by
-  // check_messages instead, which is the documented fallback.
-  if (!clientRendersChannel()) return;
+  // Without a channel AND without a resolvable session there is nowhere to deliver, so the message
+  // stays queued for check_messages. That is the only remaining case where a message waits to be
+  // asked for.
+  if (!clientRendersChannel() && sessionPid === null) return;
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
@@ -473,27 +533,43 @@ async function pollAndPushMessages() {
         // Non-critical, proceed without sender info
       }
 
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
+      if (clientRendersChannel()) {
+        // Push as channel notification — this is what makes it immediate
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              from_summary: fromSummary,
+              from_cwd: fromCwd,
+              sent_at: msg.sent_at,
+            },
           },
-        },
-      });
+        });
+        log(`Pushed message from ${msg.from_id} (${msg.text.length} chars)`);
+      } else {
+        // No channel, so write it where a hook will find it. Throws on a failed write, which skips
+        // the ack below and leaves the message queued for the next cycle: the same durability rule
+        // the push path relies on.
+        spoolMessage(sessionPid!, {
+          id: msg.id,
+          from_id: msg.from_id,
+          from_summary: fromSummary,
+          from_cwd: fromCwd,
+          sent_at: msg.sent_at,
+          text: msg.text,
+        });
+        log(`Spooled message from ${msg.from_id} (${msg.text.length} chars)`);
+      }
 
-      // Rendered to the user, so it is safe to destroy broker-side. Acking
-      // only after a successful push is what makes delivery durable: a crash
-      // between poll and push leaves the message queued for the next cycle.
+      // Handed to something that will render it, so it is safe to destroy broker-side. Acking only
+      // after delivery is what makes it durable: a crash in between leaves the message queued.
+      //
+      // Log the fact, never the text: stderr is captured to a log file that has none of the
+      // database's permission, secure_delete or TTL protections.
       pushedMessageIds.add(msg.id);
       await ackMessages([msg.id]);
-
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
     }
   } catch (e) {
     // Broker might be down temporarily, don't crash
@@ -571,6 +647,16 @@ async function main() {
   log("MCP connected");
 
   // 6. Start polling for inbound messages
+  //
+  // Clear out queues belonging to sessions that have since exited. A pid is reused eventually, and
+  // inheriting a dead session's unread messages would deliver somebody else's conversation into
+  // this one. Cheap, and once per process is enough: the risk arrives with a NEW session, which
+  // runs this itself.
+  try {
+    sweepDeadSpools();
+  } catch {
+    // A queue that cannot be swept is not a reason to refuse to start.
+  }
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
   // 7. Start heartbeat

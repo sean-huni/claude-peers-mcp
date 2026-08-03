@@ -34,8 +34,11 @@ const MSG_TTL_MS = parseInt(process.env.CLAUDE_PEERS_MSG_TTL ?? "3600000", 10);
 // --- Database setup ---
 
 const db = new Database(DB_PATH);
-db.run("PRAGMA journal_mode = WAL");
+// busy_timeout first: journal_mode = WAL is the statement that contends when
+// several brokers race on a cold database, and without a retry window all of
+// them die with SQLITE_BUSY, leaving no broker at all.
 db.run("PRAGMA busy_timeout = 3000");
+db.run("PRAGMA journal_mode = WAL");
 // Zero freed pages rather than leaving message text recoverable in the freelist.
 db.run("PRAGMA secure_delete = ON");
 
@@ -85,15 +88,26 @@ db.run(`
   if (!existing.has("token")) db.run("ALTER TABLE peers ADD COLUMN token TEXT");
 }
 
+/**
+ * Whether a pid belongs to a running process.
+ *
+ * EPERM means the process exists but is owned by another user, which is the
+ * opposite of dead. Treating it as dead deletes a live peer and its mail.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
 // Clean up stale peers (PIDs that no longer exist) on startup
 function cleanStalePeers() {
   const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
   for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
+    if (!isProcessAlive(peer.pid)) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ?", [peer.id]);
     }
@@ -129,16 +143,18 @@ const deletePeer = db.prepare(`
   DELETE FROM peers WHERE id = ?
 `);
 
+// Never SELECT * here: the row carries the auth token, and these results are
+// serialised straight to any caller. Project the public columns only.
 const selectAllPeers = db.prepare(`
-  SELECT * FROM peers
+  SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen FROM peers
 `);
 
 const selectPeersByDirectory = db.prepare(`
-  SELECT * FROM peers WHERE cwd = ?
+  SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen FROM peers WHERE cwd = ?
 `);
 
 const selectPeersByGitRoot = db.prepare(`
-  SELECT * FROM peers WHERE git_root = ?
+  SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen FROM peers WHERE git_root = ?
 `);
 
 const insertMessage = db.prepare(`
@@ -153,11 +169,9 @@ const selectUndelivered = db.prepare(`
 // Acknowledgement deletes rather than flagging: a delivered message has no
 // further use, and retaining it leaves plaintext in the file indefinitely.
 //
-// The to_id predicate keeps a cooperating client from acking mail that is not
-// its own. It is NOT a security boundary: peer_id is supplied by the caller and
-// peer ids are public via /list-peers, so any local process can delete another
-// peer's queued mail. Closing that needs request authentication, which the
-// broker does not yet have. See docs/specs/RECOVERY.md, prerequisite 1.
+// The to_id predicate scopes the delete to the caller's own mailbox. It is
+// backed by the bearer check in isAuthorized below, which resolves the caller
+// from the token rather than from the body.
 const ackMessage = db.prepare(`
   DELETE FROM messages WHERE id = ? AND to_id = ?
 `);
@@ -188,9 +202,13 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
 
-  // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
-  if (existing) {
+  // Reclaim a row whose process is gone. Registration is unauthenticated and
+  // pid is caller-supplied, so evicting a LIVE peer here would let any local
+  // process kill every session's peering with one request.
+  const existing = db.query("SELECT id, pid FROM peers WHERE pid = ?").get(body.pid) as
+    | { id: string; pid: number }
+    | null;
+  if (existing && !isProcessAlive(existing.pid)) {
     deletePeer.run(existing.id);
   }
 
@@ -236,14 +254,9 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 
   // Verify each peer's process is still alive
   return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-      return true;
-    } catch {
-      // Clean up dead peer
-      deletePeer.run(p.id);
-      return false;
-    }
+    if (isProcessAlive(p.pid)) return true;
+    deletePeer.run(p.id);
+    return false;
   });
 }
 

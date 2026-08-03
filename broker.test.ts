@@ -233,3 +233,49 @@ test("registration mints a high entropy token", async () => {
   const b = await register("/tmp/entropy-2");
   expect(b.token).not.toBe(a.token);
 });
+
+test("list_peers never exposes another peer's auth token", async () => {
+  // The token is the whole authentication story. Publishing it on an
+  // authenticated route is worthless, because /register is unauthenticated by
+  // design, so anyone can obtain a token and then harvest everyone else's.
+  const victim = await register("/tmp/token-victim");
+  const observer = await register("/tmp/token-observer");
+
+  const listing = await post<Record<string, unknown>[]>(
+    "/list-peers",
+    { scope: "machine", cwd: "/tmp", git_root: null, exclude_id: observer.id },
+    observer.token
+  );
+
+  expect(listing.length).toBeGreaterThan(0);
+  for (const peer of listing) {
+    expect(Object.keys(peer)).not.toContain("token");
+  }
+  expect(JSON.stringify(listing)).not.toContain(victim.token);
+});
+
+test("registration cannot evict a live peer by claiming its pid", async () => {
+  // /register takes no credential and pid is caller-supplied, so an attacker
+  // who reads a pid from list_peers must not be able to unregister that
+  // session out from under it.
+  const victimPid = livePid();
+  const victim = await post<{ id: string; token: string }>("/register", {
+    pid: victimPid,
+    cwd: "/tmp/evict-victim",
+    git_root: null,
+    tty: null,
+    summary: "",
+  });
+
+  await post("/register", {
+    pid: victimPid, // same pid, no credential
+    cwd: "/tmp/attacker",
+    git_root: null,
+    tty: null,
+    summary: "",
+  });
+
+  // The victim is still authenticated and still addressable.
+  const stillAlive = await rawPost("/heartbeat", { id: victim.id }, victim.token);
+  expect(stillAlive.status).toBe(200);
+});

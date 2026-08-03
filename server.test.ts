@@ -17,10 +17,10 @@ const ENV = { ...process.env, CLAUDE_PEERS_PORT: String(PORT), CLAUDE_PEERS_DB: 
 
 const clients: { proc: ReturnType<typeof Bun.spawn> }[] = [];
 
-function spawnClient(cwd: string, withChannel: boolean) {
+function spawnClient(cwd: string, withChannel: boolean, channelMode?: string) {
   const proc = Bun.spawn(["bun", `${import.meta.dir}/server.ts`], {
     cwd,
-    env: ENV,
+    env: channelMode ? { ...ENV, CLAUDE_PEERS_CHANNEL: channelMode } : ENV,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "ignore",
@@ -181,12 +181,14 @@ test("check_messages acknowledges, so a message is not returned twice", async ()
   expect(await receiver.tool(3, "check_messages")).toContain("No new messages");
 }, 30_000);
 
-test("a channel-capable client is still pushed to immediately", async () => {
-  // The capability gate must not cost the fast path its push.
+test("a channel-enabled session is still pushed to immediately", async () => {
+  // The gate must not cost the fast path its push. Note the signal is the
+  // session's channel mode, NOT an advertised client capability: Claude Code
+  // never advertises one.
   const senderDir = workdir();
   const receiverDir = workdir();
   const sender = spawnClient(senderDir, false);
-  const receiver = spawnClient(receiverDir, true);
+  const receiver = spawnClient(receiverDir, false, "always");
 
   await sender.initialize(1);
   await receiver.initialize(1);
@@ -199,4 +201,46 @@ test("a channel-capable client is still pushed to immediately", async () => {
   const pushed = receiver.notifications.filter((n) => String(n.method).includes("channel"));
   expect(pushed.length).toBeGreaterThan(0);
   expect(JSON.stringify(pushed[0].params)).toContain("pushed over the channel");
+}, 30_000);
+
+test("a real Claude Code client is pushed to, despite advertising no experimental capability", async () => {
+  // The production shape. Claude Code's initialize frame carries only
+  // {roots, elicitation}: it never advertises experimental["claude/channel"],
+  // even when launched with --dangerously-load-development-channels. Gating the
+  // push on that capability therefore disabled instant delivery for every real
+  // session while the tests, which invented the capability, stayed green.
+  const senderDir = workdir();
+  const receiverDir = workdir();
+  const sender = spawnClient(senderDir, false);
+  const receiver = spawnClient(receiverDir, false, "always"); // advertises nothing
+
+  await sender.initialize(1);
+  await receiver.initialize(1);
+  await Bun.sleep(3000);
+
+  const target = peerIdAt(await sender.tool(2, "list_peers", { scope: "machine" }), receiverDir);
+  await sender.tool(3, "send_message", { to_id: target, message: "pushed without advertising" });
+  await Bun.sleep(2500);
+
+  const pushed = receiver.notifications.filter((n) => String(n.method).includes("channel"));
+  expect(pushed.length).toBeGreaterThan(0);
+  expect(JSON.stringify(pushed[0].params)).toContain("pushed without advertising");
+}, 30_000);
+
+test("channel mode never falls back to check_messages", async () => {
+  const senderDir = workdir();
+  const receiverDir = workdir();
+  const sender = spawnClient(senderDir, false);
+  const receiver = spawnClient(receiverDir, true, "never"); // advertises, but disabled
+
+  await sender.initialize(1);
+  await receiver.initialize(1);
+  await Bun.sleep(3000);
+
+  const target = peerIdAt(await sender.tool(2, "list_peers", { scope: "machine" }), receiverDir);
+  await sender.tool(3, "send_message", { to_id: target, message: "queued not pushed" });
+  await Bun.sleep(2500);
+
+  expect(receiver.notifications.filter((n) => String(n.method).includes("channel"))).toHaveLength(0);
+  expect(await receiver.tool(2, "check_messages")).toContain("queued not pushed");
 }, 30_000);

@@ -9,6 +9,7 @@
   "scripts": {
     "broker": "bun broker.ts",
     "server": "bun server.ts",
+    "bench": "bun bench/delivery-latency.ts",
     "test": "bun test"
   },
   "devDependencies": {

@@ -89,6 +89,7 @@ function openDatabase(): Database {
       text TEXT NOT NULL,
       sent_at TEXT NOT NULL,
       delivered INTEGER NOT NULL DEFAULT 0,
+      reply_to TEXT,
       FOREIGN KEY (from_id) REFERENCES peers(id),
       FOREIGN KEY (to_id) REFERENCES peers(id)
     )
@@ -101,6 +102,11 @@ function openDatabase(): Database {
   );
   if (!existing.has("token")) handle.run("ALTER TABLE peers ADD COLUMN token TEXT");
   if (!existing.has("name")) handle.run("ALTER TABLE peers ADD COLUMN name TEXT");
+
+  const msgCols = new Set(
+    (handle.query("PRAGMA table_info(messages)").all() as { name: string }[]).map((c) => c.name)
+  );
+  if (!msgCols.has("reply_to")) handle.run("ALTER TABLE messages ADD COLUMN reply_to TEXT");
 
   return handle;
 }
@@ -404,8 +410,8 @@ if (SSE_ENABLED && SSE_KEEPALIVE_MS > 0) {
 
 function prepareStatements() {
   const insertMessage = db.prepare(`
-    INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
-    VALUES (?, ?, ?, ?, 0)
+    INSERT INTO messages (from_id, to_id, text, sent_at, delivered, reply_to)
+    VALUES (?, ?, ?, ?, 0, ?)
   `);
 
   const deletePeer = db.prepare(`
@@ -473,8 +479,8 @@ function prepareStatements() {
     // Safe inside a transaction: the frame is enqueued into a stream the runtime flushes after the
     // current synchronous work, so the client's follow-up poll cannot run before the commit.
     insertMessage: {
-      run(fromId: string, toId: string, text: string, sentAt: string) {
-        const changes = insertMessage.run(fromId, toId, text, sentAt);
+      run(fromId: string, toId: string, text: string, sentAt: string, replyTo: string | null = null) {
+        const changes = insertMessage.run(fromId, toId, text, sentAt, replyTo);
         notifyMailbox(toId);
         return changes;
       },
@@ -636,7 +642,13 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     return { ok: false, error: `Peer ${body.to_id} not found (no such id or name)` };
   }
 
-  stmts.insertMessage.run(body.from_id, targetId, body.text, new Date().toISOString());
+  // Bounded and stringly: the token is minted by the asking client and echoed
+  // back verbatim; the broker only stores and returns it.
+  const replyTo =
+    typeof body.reply_to === "string" && body.reply_to.length > 0 && body.reply_to.length <= 64
+      ? body.reply_to
+      : null;
+  stmts.insertMessage.run(body.from_id, targetId, body.text, new Date().toISOString(), replyTo);
   return { ok: true };
 }
 

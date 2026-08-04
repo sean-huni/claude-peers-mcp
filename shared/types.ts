@@ -21,6 +21,10 @@ export interface Message {
   text: string;
   sent_at: string; // ISO timestamp
   delivered: boolean;
+  // Correlation token of the ask this message answers, or null for an ordinary
+  // message. A string (client-minted token), never a database row id: channel
+  // meta values must be strings, and a token survives broker-database loss.
+  reply_to: string | null;
 }
 
 // --- Broker API types ---
@@ -72,6 +76,8 @@ export interface SendMessageRequest {
   // A peer id, or a peer name: the broker resolves names to ids at delivery time.
   to_id: PeerId | string;
   text: string;
+  // Set when this message answers a blocking ask: the ask's correlation token.
+  reply_to?: string;
 }
 
 /**

@@ -107,6 +107,10 @@ peer answers or the timeout lapses (default 60s, 5-300):
   inbound message.
 - No answer in time returns a timeout notice; the question was still delivered, and a late answer
   arrives as an ordinary message rather than vanishing.
+- **Only the peer you asked can answer.** The waiting call is bound to that peer, so a reply
+  quoting the token from anybody else is delivered as an ordinary message instead of resolving
+  your ask. The token travels inside a message body, so treating it alone as proof of identity
+  would trust every process that can see one.
 - Use `ask_peer` when the answer gates your next step (a decision, a value, a confirmation);
   use `send_message` for everything else.
 
@@ -260,6 +264,29 @@ id they were addressed to no longer exists. There is no replay: the sender is no
 recipient never sees them. Anything already spooled to disk for a hook-delivered session survives,
 because that queue is a separate file. **Your peer id changes** when this happens, so an id another
 session noted earlier stops resolving; `list_peers` shows the new one.
+
+## Known limitation: a peer identity does not outlive its process
+
+Verified by chaos testing, 2026-08-05. **Peer identity is bound to the MCP server's process, not to
+your Claude Code session.** If that process dies and restarts, it registers as a NEW peer, and the
+old row is reaped by the stale-peer sweep along with any mail still queued for it.
+
+Measured: with 33 messages outstanding when the receiving process was `SIGKILL`ed, everything
+already handed over survived with zero duplicates, and everything still queued for the old id was
+destroyed. The sender was told `ok` at send time and is never told otherwise.
+
+What this means in practice:
+
+- A message is durable **once delivered**: acknowledgement happens after the receiving session has
+  been handed the message, so a crash in between costs a duplicate at worst, never a loss. Verified:
+  a broker `SIGKILL` mid-stream re-delivered 60 of 60 with zero duplicates.
+- Mail in flight to a session whose MCP server restarts is **not** durable.
+- Your **name** does survive a restart: a restarting session reclaims it from its own dead peer
+  rather than being refused by its own corpse.
+
+Fixing this properly means a session-stable identity rather than a process-bound one, which is a
+design change and not yet made here. Until then, treat `ask_peer` timeouts and unanswered messages
+around a restart as expected rather than as bugs.
 
 ## Updating and relaunching
 

@@ -106,6 +106,23 @@ function withCallerId(path: string, body: unknown): unknown {
 /** In-flight re-registration, so concurrent refusals share one attempt. */
 let reregistration: Promise<void> | null = null;
 
+/**
+ * Push the remembered name to the broker under the current identity.
+ *
+ * Throws on transport failure; resolves with the broker's verdict otherwise.
+ * A "taken" verdict is surfaced to the caller rather than retried: names are
+ * contended by design and the holder is not going to release it because we ask twice.
+ */
+async function applyName(): Promise<{ ok: boolean; error?: string }> {
+  const result = await brokerFetch<{ ok: boolean; error?: string }>("/set-name", {
+    id: myId,
+    name: myName,
+  });
+  if (result.ok) log(`Peer name claimed: ${myName}`);
+  else log(`Peer name not claimed (${result.error}); running unnamed`);
+  return result;
+}
+
 async function registerWithBroker(): Promise<RegisterResponse> {
   return brokerFetch<RegisterResponse>(
     "/register",
@@ -149,6 +166,12 @@ async function recoverIdentity(staleId: PeerId | null): Promise<void> {
       // The open stream is subscribed to an identity the broker has forgotten, so it can never
       // carry anything again. Dropping it makes the loop reconnect under the new one.
       restartStream();
+      // The broker's name column died with the old row (or the old database).
+      // Re-claim, best-effort: a collision here means another session took the
+      // name in the meantime, which set_name would have refused identically.
+      if (myName) {
+        applyName().catch(() => {});
+      }
       log(`Re-registered as peer ${myId} after the broker rejected the previous identity`);
     } finally {
       reregistration = null;
@@ -277,6 +300,9 @@ let myGitRoot: string | null = null;
 // nameless one: the broker's copy of both is lost with its database.
 let myTty: string | null = null;
 let mySummary = "";
+// The claimed peer name, remembered here so re-registration and broker-database
+// loss can re-claim it. Empty string means unnamed.
+let myName = (process.env.CLAUDE_PEERS_NAME ?? "").trim();
 
 // --- MCP Server ---
 
@@ -327,13 +353,14 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification.",
+      "Send a message to another Claude Code instance by peer ID or peer name. The message will be pushed into their session immediately via channel notification.",
     inputSchema: {
       type: "object" as const,
       properties: {
         to_id: {
           type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers)",
+          description:
+            'The peer ID or peer name of the target Claude Code instance (both shown by list_peers, e.g. "a1b2c3d4" or "zod")',
         },
         message: {
           type: "string" as const,
@@ -398,6 +425,34 @@ const TOOLS = [
       properties: {},
     },
   },
+  {
+    name: "set_name",
+    description:
+      "Claim a human-readable peer name for this session (e.g. the name your user calls you). " +
+      "Other sessions can then send_message to the name instead of the 8-char ID. Names are " +
+      "unique per broker: claiming one another live peer holds fails. Also settable at launch " +
+      "via the CLAUDE_PEERS_NAME environment variable.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        name: {
+          type: "string" as const,
+          description:
+            "1-32 chars, letters/digits/space/dash/underscore, starting alphanumeric. Case-insensitively unique.",
+        },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "whoami",
+    description:
+      "Report this session's own peer identity: ID, name (if any), working directory, git root, and current summary. Use it to tell a user or peer how this session can be addressed.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -437,6 +492,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
+          if (p.name) parts.push(`Name: ${p.name}`);
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
@@ -580,6 +636,62 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
+    }
+
+    case "set_name": {
+      const { name: wanted } = args as { name: string };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/set-name", {
+          id: myId,
+          name: wanted,
+        });
+        if (!result.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Could not claim name: ${result.error}` }],
+            isError: true,
+          };
+        }
+        // Remembered so a later re-registration can re-claim it: the broker's
+        // copy dies with its database, same as the summary.
+        myName = wanted.trim();
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Name claimed: "${myName}". Peers can now send_message to it directly.`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error setting name: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "whoami": {
+      const parts = [
+        `ID: ${myId ?? "(not registered)"}`,
+        `Name: ${myName || "(none — claim one with set_name)"}`,
+        `CWD: ${myCwd}`,
+        `Repo: ${myGitRoot ?? "(none)"}`,
+        `Summary: ${mySummary || "(none)"}`,
+      ];
+      return {
+        content: [{ type: "text" as const, text: parts.join("\n") }],
+      };
     }
 
     case "check_messages": {
@@ -751,6 +863,7 @@ async function pollAndPushMessages() {
       // Look up the sender's info for context
       let fromSummary = "";
       let fromCwd = "";
+      let fromName = "";
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope: "machine",
@@ -762,19 +875,26 @@ async function pollAndPushMessages() {
         if (sender) {
           fromSummary = sender.summary;
           fromCwd = sender.cwd;
+          fromName = sender.name ?? "";
         }
       } catch {
         // Non-critical, proceed without sender info
       }
 
       if (clientRendersChannel()) {
-        // Push as channel notification — this is what makes it immediate
+        // Push as channel notification — this is what makes it immediate.
+        //
+        // Every meta value MUST be a string: Claude Code Zod-validates channel
+        // notifications, and a non-string value does not merely drop the event,
+        // the handler error kills the whole stdio MCP connection (lesson
+        // imported from the synaq fork, learned there 2026-07-30).
         await mcp.notification({
           method: "notifications/claude/channel",
           params: {
             content: msg.text,
             meta: {
               from_id: msg.from_id,
+              from_name: fromName,
               from_summary: fromSummary,
               from_cwd: fromCwd,
               sent_at: msg.sent_at,
@@ -789,6 +909,7 @@ async function pollAndPushMessages() {
         spoolMessage(sessionPid!, {
           id: msg.id,
           from_id: msg.from_id,
+          from_name: fromName,
           from_summary: fromSummary,
           from_cwd: fromCwd,
           sent_at: msg.sent_at,
@@ -1051,6 +1172,14 @@ async function main() {
   myId = reg.id;
   myToken = reg.token;
   log(`Registered as peer ${myId}`);
+
+  // CLAUDE_PEERS_NAME: claim at startup, non-blocking and non-fatal. A "taken"
+  // verdict logs and runs unnamed rather than failing the session over a label.
+  if (myName) {
+    applyName().catch((e) =>
+      log(`Peer name claim failed (non-critical): ${e instanceof Error ? e.message : String(e)}`)
+    );
+  }
 
   // Apply the summary whenever it lands. Unconditional now: nothing above waits for it, so it is
   // never already present at this point.

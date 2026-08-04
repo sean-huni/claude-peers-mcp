@@ -17,6 +17,8 @@ import type {
   RegisterResponse,
   HeartbeatRequest,
   SetSummaryRequest,
+  SetNameRequest,
+  SetNameResponse,
   ListPeersRequest,
   SendMessageRequest,
   BroadcastMessageRequest,
@@ -98,6 +100,7 @@ function openDatabase(): Database {
     (handle.query("PRAGMA table_info(peers)").all() as { name: string }[]).map((c) => c.name)
   );
   if (!existing.has("token")) handle.run("ALTER TABLE peers ADD COLUMN token TEXT");
+  if (!existing.has("name")) handle.run("ALTER TABLE peers ADD COLUMN name TEXT");
 
   return handle;
 }
@@ -427,6 +430,16 @@ function prepareStatements() {
       UPDATE peers SET summary = ? WHERE id = ?
     `),
 
+    updateName: db.prepare(`
+      UPDATE peers SET name = ? WHERE id = ?
+    `),
+
+    // Case-insensitive: "Zod" and "zod" are one handle. The exclusion arm lets a
+    // peer re-assert its own name without colliding with itself.
+    selectPeerByName: db.prepare(`
+      SELECT id FROM peers WHERE name = ? COLLATE NOCASE AND id != ?
+    `),
+
     // Wrapped rather than exposed raw, so every caller that removes a peer also drops its streams.
     // A stream for an id the broker has forgotten can never carry anything again; left open it is
     // a descriptor and a controller held for nobody.
@@ -441,15 +454,15 @@ function prepareStatements() {
     // Never SELECT * here: the row carries the auth token, and these results are
     // serialised straight to any caller. Project the public columns only.
     selectAllPeers: db.prepare(`
-      SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen FROM peers
+      SELECT id, pid, cwd, git_root, tty, summary, name, registered_at, last_seen FROM peers
     `),
 
     selectPeersByDirectory: db.prepare(`
-      SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen FROM peers WHERE cwd = ?
+      SELECT id, pid, cwd, git_root, tty, summary, name, registered_at, last_seen FROM peers WHERE cwd = ?
     `),
 
     selectPeersByGitRoot: db.prepare(`
-      SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen FROM peers WHERE git_root = ?
+      SELECT id, pid, cwd, git_root, tty, summary, name, registered_at, last_seen FROM peers WHERE git_root = ?
     `),
 
     // THE NOTIFICATION HOOK. Wrapping the statement rather than calling notifyMailbox from
@@ -539,6 +552,27 @@ function handleSetSummary(body: SetSummaryRequest): void {
 }
 
 /**
+ * A name is a routable address (send_message accepts it in place of an id), so
+ * it is validated like one: bounded, printable, and unique among registered
+ * peers. Uniqueness at SET time is what keeps resolution at SEND time
+ * unambiguous by construction; without it, every send would need a tiebreak.
+ */
+const NAME_RULE = /^[A-Za-z0-9][A-Za-z0-9 _-]{0,31}$/;
+
+function handleSetName(body: SetNameRequest): SetNameResponse {
+  const name = String(body.name ?? "").trim();
+  if (!NAME_RULE.test(name)) {
+    return { ok: false, error: "invalid: 1-32 chars, letters/digits/space/dash/underscore, must start alphanumeric" };
+  }
+  const holder = stmts.selectPeerByName.get(name, body.id) as { id: string } | null;
+  if (holder) {
+    return { ok: false, error: `taken ${holder.id}` };
+  }
+  stmts.updateName.run(name, body.id);
+  return { ok: true };
+}
+
+/**
  * The peers a scope selects, minus the caller, minus anything whose process has died.
  *
  * Shared by /list-peers and /broadcast-message so a broadcast's audience is exactly the peers the
@@ -585,13 +619,24 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
-  if (!target) {
-    return { ok: false, error: `Peer ${body.to_id} not found` };
+  // to_id is an id first, a name second. Ids are 8 lowercase hex-ish chars and
+  // names must start alphanumeric with a 32-char cap, so a string can match
+  // both tables; the id lookup winning keeps old callers' behaviour exact.
+  let targetId = (
+    db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null
+  )?.id;
+  if (!targetId) {
+    targetId = (
+      db.query("SELECT id FROM peers WHERE name = ? COLLATE NOCASE").get(body.to_id) as {
+        id: string;
+      } | null
+    )?.id;
+  }
+  if (!targetId) {
+    return { ok: false, error: `Peer ${body.to_id} not found (no such id or name)` };
   }
 
-  stmts.insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+  stmts.insertMessage.run(body.from_id, targetId, body.text, new Date().toISOString());
   return { ok: true };
 }
 
@@ -667,6 +712,9 @@ function handleUnregister(body: { id: string }): void {
 const CALLER_FIELD: Record<string, string> = {
   "/heartbeat": "id",
   "/set-summary": "id",
+  // A name is an address: letting an unauthenticated caller rename a peer is
+  // letting them redirect that peer's inbound mail.
+  "/set-name": "id",
   "/list-peers": "exclude_id",
   "/send-message": "from_id",
   // Unauthenticated this would be the loudest route in the system: one call injecting a message
@@ -726,6 +774,8 @@ function dispatch(req: Request, path: string, body: unknown): Response {
     case "/set-summary":
       handleSetSummary(body as SetSummaryRequest);
       return Response.json({ ok: true });
+    case "/set-name":
+      return Response.json(handleSetName(body as SetNameRequest));
     case "/list-peers":
       return Response.json(handleListPeers(body as ListPeersRequest));
     case "/send-message":

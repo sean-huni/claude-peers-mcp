@@ -170,14 +170,9 @@ what the session did before. A broker that does not serve `/subscribe` at all, a
 started with `CLAUDE_PEERS_SSE=off`, is therefore not a broker a session goes deaf against, only a
 slower one.
 
-| Variable                       | Default | What it changes                                        |
-| ------------------------------ | ------- | ------------------------------------------------------ |
-| `CLAUDE_PEERS_SSE`             | `on`    | Broker: `off` makes `/subscribe` a 404                 |
-| `CLAUDE_PEERS_STREAM`          | `on`    | Server: `off` disables subscribing, polling only       |
-| `CLAUDE_PEERS_POLL_MS`         | `1000`  | Poll interval while there is no healthy stream         |
-| `CLAUDE_PEERS_POLL_IDLE_MS`    | `30000` | Poll interval while the stream is healthy              |
-| `CLAUDE_PEERS_SSE_KEEPALIVE_MS`| `25000` | Broker: comment frames down an idle stream             |
-| `CLAUDE_PEERS_STREAM_IDLE_MS`  | `75000` | Server: silence after which a stream is presumed dead  |
+Both halves of the transport are switchable, and the timings are tunable: see the delivery
+transport table under [Configuration](#configuration). Turning `CLAUDE_PEERS_SSE` off at the broker
+or `CLAUDE_PEERS_STREAM` off at a session is how the polling-only path is exercised deliberately.
 
 Measure it on your own machine with the harness, which runs unmodified against any checkout:
 
@@ -344,19 +339,53 @@ You can also inspect and interact from the command line:
 cd ~/claude-peers-mcp
 
 bun cli.ts status            # broker status + all peers
-bun cli.ts peers             # list peers
-bun cli.ts send <id> <msg>   # send a message into a Claude session
+bun cli.ts peers             # list peers, showing "<id> (<name>)" for named ones
+bun cli.ts send <id> <msg>   # send a message into a Claude session (a peer NAME works too)
 bun cli.ts broadcast <msg>   # send a message into every Claude session on the machine
 bun cli.ts kill-broker       # stop the broker
 ```
 
 ## Configuration
 
-| Environment variable | Default              | Description                           |
-| -------------------- | -------------------- | ------------------------------------- |
-| `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
-| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
-| `ANTHROPIC_API_KEY`  | Keychain OAuth token | Auto-summary credential (optional)    |
+Every setting has a working default, so a fresh clone runs with no environment at all. These are
+the override points.
+
+**Identity and storage**
+
+| Environment variable      | Default                    | Description                                          |
+| ------------------------- | -------------------------- | ---------------------------------------------------- |
+| `CLAUDE_PEERS_PORT`       | `7899`                     | Broker port                                          |
+| `CLAUDE_PEERS_DB`         | `~/.claude-peers.db`       | SQLite database path                                 |
+| `CLAUDE_PEERS_NAME`       | unset                      | Claim this peer name at startup (see Peer names)     |
+| `CLAUDE_PEERS_SPOOL_DIR`  | `~/.claude-peers/inbox`    | Per-session queue for sessions without channel push  |
+| `ANTHROPIC_API_KEY`       | Keychain OAuth token       | Auto-summary credential (optional)                   |
+
+**Delivery transport**
+
+| Environment variable            | Default | Description                                                |
+| ------------------------------- | ------- | ---------------------------------------------------------- |
+| `CLAUDE_PEERS_SSE`              | `on`    | Broker: `off` makes `/subscribe` a 404                     |
+| `CLAUDE_PEERS_STREAM`           | `on`    | Server: `off` disables subscribing, polling only           |
+| `CLAUDE_PEERS_CHANNEL`          | detect  | `always` or `never` to override channel detection          |
+| `CLAUDE_PEERS_POLL_MS`          | `1000`  | Poll interval while there is no healthy stream             |
+| `CLAUDE_PEERS_POLL_IDLE_MS`     | `30000` | Poll interval while the stream is healthy                  |
+| `CLAUDE_PEERS_SSE_KEEPALIVE_MS` | `25000` | Broker: comment frames down an idle stream                 |
+| `CLAUDE_PEERS_STREAM_IDLE_MS`   | `75000` | Server: silence after which a stream is presumed dead      |
+| `CLAUDE_PEERS_STREAM_STABLE_MS` | `5000`  | How long a stream must hold before its backoff resets      |
+
+**Retention and backoff**
+
+| Environment variable               | Default   | Description                                              |
+| ---------------------------------- | --------- | -------------------------------------------------------- |
+| `CLAUDE_PEERS_MSG_TTL`             | `3600000` | Undelivered messages are swept after this many ms (1h)   |
+| `CLAUDE_PEERS_CHECKPOINT_MS`       | `1000`    | Debounce before the WAL is checkpointed after a delete   |
+| `CLAUDE_PEERS_POLL_BACKOFF_MAX_MS` | `60000`   | Ceiling on poll backoff while the broker is unreachable  |
+| `CLAUDE_PEERS_POLL_QUIET_MS`       | `300000`  | How often a sustained broker outage is re-reported       |
+
+**Test-only.** These exist so a test run cannot collide with a live session, and are not
+meant for normal use: `CLAUDE_PEERS_SESSION_PID` (pin the host session instead of walking the
+process tree), `CLAUDE_PEERS_TEST_PORT_MIN` / `CLAUDE_PEERS_TEST_PORT_MAX` (default `7810`-`7824`,
+the range suites draw ports from, deliberately excluding the live `7899`).
 
 
 ## Benchmarking delivery

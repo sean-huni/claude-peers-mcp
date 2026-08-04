@@ -304,6 +304,13 @@ let mySummary = "";
 // loss can re-claim it. Empty string means unnamed.
 let myName = (process.env.CLAUDE_PEERS_NAME ?? "").trim();
 
+// Blocking asks in flight, keyed by their correlation token. The delivery loop
+// resolves a waiter instead of rendering the reply as an inbound message.
+const pendingAsks = new Map<
+  string,
+  { resolve: (reply: { text: string; from_id: string }) => void }
+>();
+
 // --- MCP Server ---
 
 const mcp = new Server(
@@ -366,8 +373,42 @@ const TOOLS = [
           type: "string" as const,
           description: "The message to send",
         },
+        in_reply_to: {
+          type: "string" as const,
+          description:
+            "When answering a blocking ask: the ask token quoted in that message (e.g. from " +
+            '"[Blocking ask #a1b2c3d4 ...]"). Routes your answer to the waiting session instead ' +
+            "of its normal inbox.",
+        },
       },
       required: ["to_id", "message"],
+    },
+  },
+  {
+    name: "ask_peer",
+    description:
+      "Ask another Claude Code instance a question and WAIT for its answer, up to a timeout. " +
+      "Blocking: use it when you need the answer to continue (a decision, a value, a confirmation), " +
+      "and send_message when you do not. The peer sees your question as a normal message with " +
+      "reply instructions embedded; if it does not answer in time you get a timeout notice and " +
+      "any late answer arrives as an ordinary message.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        to_id: {
+          type: "string" as const,
+          description: "The peer ID or peer name to ask (from list_peers)",
+        },
+        question: {
+          type: "string" as const,
+          description: "The question. Make it self-contained: the peer answers with only this text as context.",
+        },
+        timeout_seconds: {
+          type: "number" as const,
+          description: "How long to wait for the answer. Default 60, min 5, max 300.",
+        },
+      },
+      required: ["to_id", "question"],
     },
   },
   {
@@ -522,7 +563,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      const { to_id, message, in_reply_to } = args as {
+        to_id: string;
+        message: string;
+        in_reply_to?: string;
+      };
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -534,6 +579,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           from_id: myId,
           to_id,
           text: message,
+          ...(in_reply_to ? { reply_to: String(in_reply_to) } : {}),
         });
         if (!result.ok) {
           return {
@@ -550,6 +596,93 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               type: "text" as const,
               text: `Error sending message: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "ask_peer": {
+      const { to_id, question, timeout_seconds } = args as {
+        to_id: string;
+        question: string;
+        timeout_seconds?: number;
+      };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      const waitMs = Math.min(300, Math.max(5, Number(timeout_seconds) || 60)) * 1000;
+      // Client-minted correlation token: survives broker-database loss (a row id
+      // would not) and is a string end to end, so it can never poison channel meta.
+      const askId = Math.random().toString(36).slice(2, 10);
+      const replyAddress = myName || myId;
+
+      // The instructions ride in the TEXT, not in meta: the receiving model reads
+      // the text, and a peer running an older server still sees how to answer
+      // (its plain reply then arrives after our timeout as an ordinary message).
+      const framed =
+        `${question}\n\n` +
+        `[Blocking ask #${askId} — the sender is WAITING on this right now. Answer immediately ` +
+        `with the send_message tool: to_id="${replyAddress}", in_reply_to="${askId}", and put the ` +
+        `complete answer in message.]`;
+
+      try {
+        const sent = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+          from_id: myId,
+          to_id,
+          text: framed,
+        });
+        if (!sent.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to ask: ${sent.error}` }],
+            isError: true,
+          };
+        }
+
+        const reply = await new Promise<{ text: string; from_id: string } | null>((resolve) => {
+          const timer = setTimeout(() => {
+            pendingAsks.delete(askId);
+            resolve(null);
+          }, waitMs);
+          pendingAsks.set(askId, {
+            resolve: (r) => {
+              clearTimeout(timer);
+              resolve(r);
+            },
+          });
+        });
+
+        if (reply === null) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `No answer from ${to_id} within ${waitMs / 1000}s (ask #${askId}). The question ` +
+                  `was still delivered; a late answer will arrive as an ordinary message.`,
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Answer from ${reply.from_id} (ask #${askId}):\n\n${reply.text}`,
+            },
+          ],
+        };
+      } catch (e) {
+        pendingAsks.delete(askId);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error asking peer: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
           isError: true,
@@ -860,6 +993,24 @@ async function pollAndPushMessages() {
     const fresh = result.messages.filter((m) => !pushedMessageIds.has(m.id));
 
     for (const msg of fresh) {
+      // A reply to a blocking ask is consumed by the waiter, never rendered as
+      // a second inbound message. Routing it HERE, in the one delivery path,
+      // is what makes double delivery impossible rather than merely unlikely:
+      // the stream and the poll both funnel into this loop, and a message is
+      // either a waiter's answer or an ordinary message, decided once.
+      if (msg.reply_to) {
+        const waiter = pendingAsks.get(msg.reply_to);
+        if (waiter) {
+          pendingAsks.delete(msg.reply_to);
+          pushedMessageIds.add(msg.id);
+          await ackMessages([msg.id]);
+          waiter.resolve({ text: msg.text, from_id: msg.from_id });
+          continue;
+        }
+        // No waiter (it timed out, or this session restarted): fall through and
+        // deliver as an ordinary message rather than dropping an answer.
+      }
+
       // Look up the sender's info for context
       let fromSummary = "";
       let fromCwd = "";

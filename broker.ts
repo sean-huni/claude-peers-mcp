@@ -636,7 +636,11 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   return selectPeers(body);
 }
 
-function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
+function handleSendMessage(body: SendMessageRequest): {
+  ok: boolean;
+  error?: string;
+  to_id?: string;
+} {
   // to_id is an id first, a name second. Ids are 8 lowercase hex-ish chars and
   // names must start alphanumeric with a 32-char cap, so a string can match
   // both tables; the id lookup winning keeps old callers' behaviour exact.
@@ -661,7 +665,10 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
       ? body.reply_to
       : null;
   stmts.insertMessage.run(body.from_id, targetId, body.text, new Date().toISOString(), replyTo);
-  return { ok: true };
+  // The resolved id, not what the caller wrote: addressing by name must tell the
+  // caller WHICH peer it reached, which is what lets ask_peer bind its waiter to
+  // that peer instead of trusting any reply that quotes the token.
+  return { ok: true, to_id: targetId };
 }
 
 /**

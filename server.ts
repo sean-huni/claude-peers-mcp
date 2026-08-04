@@ -308,7 +308,13 @@ let myName = (process.env.CLAUDE_PEERS_NAME ?? "").trim();
 // resolves a waiter instead of rendering the reply as an inbound message.
 const pendingAsks = new Map<
   string,
-  { resolve: (reply: { text: string; from_id: string }) => void }
+  {
+    // The peer this ask was actually delivered to. A reply is only an answer if
+    // it comes from them: the token travels in a message body, so any peer that
+    // learns or guesses one could otherwise resolve somebody else's ask.
+    expect: string;
+    resolve: (reply: { text: string; from_id: string }) => void;
+  }
 >();
 
 // --- MCP Server ---
@@ -631,11 +637,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         `complete answer in message.]`;
 
       try {
-        const sent = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
-          from_id: myId,
-          to_id,
-          text: framed,
-        });
+        const sent = await brokerFetch<{ ok: boolean; error?: string; to_id?: string }>(
+          "/send-message",
+          { from_id: myId, to_id, text: framed }
+        );
         if (!sent.ok) {
           return {
             content: [{ type: "text" as const, text: `Failed to ask: ${sent.error}` }],
@@ -649,6 +654,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             resolve(null);
           }, waitMs);
           pendingAsks.set(askId, {
+            // Resolved id when the broker reported one; otherwise what the caller
+            // typed, which is correct whenever it was already an id.
+            expect: sent.to_id ?? to_id,
             resolve: (r) => {
               clearTimeout(timer);
               resolve(r);
@@ -1000,15 +1008,17 @@ async function pollAndPushMessages() {
       // either a waiter's answer or an ordinary message, decided once.
       if (msg.reply_to) {
         const waiter = pendingAsks.get(msg.reply_to);
-        if (waiter) {
+        if (waiter && waiter.expect === msg.from_id) {
           pendingAsks.delete(msg.reply_to);
           pushedMessageIds.add(msg.id);
           await ackMessages([msg.id]);
           waiter.resolve({ text: msg.text, from_id: msg.from_id });
           continue;
         }
-        // No waiter (it timed out, or this session restarted): fall through and
-        // deliver as an ordinary message rather than dropping an answer.
+        // Either no waiter (it timed out, or this session restarted), or a reply
+        // quoting the token from a peer we did not ask. Both fall through and
+        // deliver as an ordinary message rather than dropping it: an unexpected
+        // answer is still somebody talking to this session.
       }
 
       // Look up the sender's info for context

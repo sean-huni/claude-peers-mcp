@@ -201,6 +201,52 @@ test("an unknown name fails the send rather than dropping the message", async ()
   expect(String(res.body.error)).toContain("not found");
 });
 
+test("reply_to is stored only when it is a bounded string", async () => {
+  // The constraint sweep (2026-08-05) mutated this validation away and the whole
+  // suite stayed green: nothing tested it. reply_to is echoed back to clients and
+  // used as a Map key by the asking session, so a non-string or unbounded value
+  // is both a correlation hazard and unbounded attacker-controlled storage.
+  const a = await reg("/tmp/reply-a");
+  const b = await reg("/tmp/reply-b");
+
+  const cases: { label: string; value: unknown; keep: boolean }[] = [
+    { label: "ordinary token", value: "abc12345", keep: true },
+    { label: "64 chars (the limit)", value: "x".repeat(64), keep: true },
+    { label: "65 chars (over the limit)", value: "x".repeat(65), keep: false },
+    { label: "empty string", value: "", keep: false },
+    { label: "number", value: 12345, keep: false },
+    { label: "object", value: { evil: true }, keep: false },
+    { label: "array", value: ["a"], keep: false },
+    { label: "boolean", value: true, keep: false },
+  ];
+
+  for (const c of cases) {
+    const text = `reply-case:${c.label}`;
+    const sent = await post(
+      "/send-message",
+      { from_id: a.id, to_id: b.id, text, reply_to: c.value },
+      a.token
+    );
+    // A bad reply_to must never fail the SEND: the message is still a message.
+    expect(sent.body.ok, `${c.label} should still send`).toBe(true);
+  }
+
+  const inbox = await post("/poll-messages", { id: b.id }, b.token);
+  const rows = inbox.body.messages as any[];
+  for (const c of cases) {
+    const row = rows.find((m) => m.text === `reply-case:${c.label}`);
+    expect(row, `${c.label} must have been delivered`).toBeDefined();
+    if (c.keep) {
+      expect(row.reply_to, `${c.label} should be kept verbatim`).toBe(c.value);
+    } else {
+      expect(row.reply_to, `${c.label} should be dropped to null`).toBeNull();
+    }
+    // Whatever survives is a string or null, never another type: the asking
+    // session looks this up in a string-keyed Map.
+    expect(["string", "object"]).toContain(typeof row.reply_to);
+  }
+});
+
 test("a legacy database without the name column is migrated at boot", async () => {
   // Build a pre-names schema file, then point a fresh broker at it.
   const legacyDb = join(WORK, "legacy.db");

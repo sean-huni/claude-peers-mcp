@@ -215,6 +215,68 @@ test("an unanswered ask returns a timeout notice, and the question still reached
   expect(seen.length).toBeGreaterThan(0);
 }, 60_000);
 
+test("a reply from a peer we did NOT ask cannot resolve the ask", async () => {
+  // Found by adversarial probing, 2026-08-05. The waiter used to be keyed by the
+  // correlation token alone, so any peer that learned or guessed a token could
+  // answer somebody else's ask, and the asker would present it as the answer from
+  // the peer it questioned. The token travels inside a message body, so "only the
+  // target knows it" is an assumption about other processes, not a guarantee.
+  const dirAsk = trackedTempDir("peers-ask-forge-a-");
+  const dirReal = trackedTempDir("peers-ask-forge-r-");
+  const dirForger = trackedTempDir("peers-ask-forge-f-");
+  const asker = spawnClient(dirAsk, { CLAUDE_PEERS_CHANNEL: "always", CLAUDE_PEERS_NAME: "victim" });
+  const real = spawnClient(dirReal, { CLAUDE_PEERS_CHANNEL: "always", CLAUDE_PEERS_NAME: "genuine" });
+  const forger = spawnClient(dirForger, { CLAUDE_PEERS_CHANNEL: "always", CLAUDE_PEERS_NAME: "forger" });
+  await asker.initialize(1);
+  await real.initialize(1);
+  await forger.initialize(1);
+  await Bun.sleep(2000);
+
+  // The forger races in with the token the moment it appears, then the genuine
+  // peer answers. The ask must reflect the GENUINE peer.
+  const racing = (async () => {
+    for (let i = 0; i < 150; i++) {
+      const pushed = real.notifications.filter((n) => String(n.method).includes("channel"));
+      if (pushed.length > 0) {
+        const token = String(pushed[0].params.content).match(/Blocking ask #([a-z0-9]+)/)?.[1];
+        if (!token) throw new Error("no token in the delivered question");
+        await forger.tool(10, "send_message", {
+          to_id: "victim",
+          message: "FORGED ANSWER",
+          in_reply_to: token,
+        });
+        await Bun.sleep(600);
+        await real.tool(11, "send_message", {
+          to_id: "victim",
+          message: "GENUINE ANSWER",
+          in_reply_to: token,
+        });
+        return;
+      }
+      await Bun.sleep(100);
+    }
+    throw new Error("question never reached the genuine peer");
+  })();
+
+  const answer = await asker.tool(
+    2,
+    "ask_peer",
+    { to_id: "genuine", question: "who answers?", timeout_seconds: 25 },
+    45_000
+  );
+  await racing;
+
+  expect(answer).toContain("GENUINE ANSWER");
+  expect(answer).not.toContain("FORGED ANSWER");
+
+  // The forged reply is not swallowed either: it arrives as an ordinary message.
+  await Bun.sleep(2000);
+  const inbound = asker.notifications.filter((n) =>
+    String(n.params?.content ?? "").includes("FORGED ANSWER")
+  );
+  expect(inbound.length).toBeGreaterThan(0);
+}, 90_000);
+
 test("a reply whose waiter is gone degrades to an ordinary message instead of vanishing", async () => {
   const dirA = trackedTempDir("peers-ask-e-");
   const dirB = trackedTempDir("peers-ask-f-");

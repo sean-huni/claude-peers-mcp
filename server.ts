@@ -1035,8 +1035,16 @@ async function main() {
     }
   })();
 
-  // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
+  // Deliberately NOT awaited.
+  //
+  // This used to race the summary against a 3000ms timer here, before the transport was connected,
+  // and it cost every session most of its startup: measured on dev at a median 2474ms to the
+  // initialize reply, of which 2001ms was this one network call. The wait bought nothing, because
+  // the late-apply below has always existed and covers the same ground. Registering first and
+  // filling the summary in afterwards takes the same session to 72ms.
+  //
+  // The peer is therefore visible to others for a second or two carrying no summary. That is the
+  // trade, and it is the cheap side of it.
 
   // 4. Register with broker
   const reg = await registerWithBroker();
@@ -1044,19 +1052,18 @@ async function main() {
   myToken = reg.token;
   log(`Registered as peer ${myId}`);
 
-  // If summary generation is still running, update it when done
-  if (!initialSummary) {
-    summaryPromise.then(async () => {
-      if (initialSummary && myId) {
-        try {
-          await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
-          log(`Late auto-summary applied: ${initialSummary}`);
-        } catch {
-          // Non-critical
-        }
+  // Apply the summary whenever it lands. Unconditional now: nothing above waits for it, so it is
+  // never already present at this point.
+  summaryPromise.then(async () => {
+    if (initialSummary && myId) {
+      try {
+        await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
+        log(`Late auto-summary applied: ${initialSummary}`);
+      } catch {
+        // Non-critical
       }
-    });
-  }
+    }
+  });
 
   // 5. Connect MCP over stdio
   await mcp.connect(new StdioServerTransport());

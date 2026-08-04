@@ -109,6 +109,53 @@ test("a name another registered peer holds is refused, case-insensitively", asyn
   expect((await post("/set-name", { id: a.id, name: "Zod" }, a.token)).body.ok).toBe(true);
 });
 
+test("a name held by a DEAD peer can be reclaimed, so a restarted session keeps its name", async () => {
+  // Found by chaos testing, 2026-08-05. A session that restarts re-registers under a
+  // new peer id, while its previous row survives until the 30s stale sweep. The old
+  // row still held the name, so the restarted session was told "taken" by its own
+  // corpse and ran unnamed. CLAUDE_PEERS_NAME made this the default experience of
+  // every restart inside that window, which is exactly when people restart.
+  const proc = trackProcess(Bun.spawn(["sleep", "300"], { stdout: "ignore", stderr: "ignore" }));
+  held.push(proc);
+  const doomed = await (
+    await fetch(`${B}/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ pid: proc.pid, cwd: "/tmp/names-dead", git_root: null, tty: null, summary: "" }),
+    })
+  ).json() as { id: string; token: string };
+  expect((await post("/set-name", { id: doomed.id, name: "phoenix" }, doomed.token)).body.ok).toBe(true);
+
+  // The process dies. The row is still there: the sweep runs on its own clock.
+  proc.kill(9);
+  await Bun.sleep(300);
+
+  const reborn = await reg("/tmp/names-reborn");
+  const claim = await post("/set-name", { id: reborn.id, name: "phoenix" }, reborn.token);
+  expect(claim.body.error ?? "").not.toContain("taken");
+  expect(claim.body.ok).toBe(true);
+
+  // And the name resolves to the LIVING peer, not the corpse.
+  const sender = await reg("/tmp/names-sender");
+  expect(
+    (await post("/send-message", { from_id: sender.id, to_id: "phoenix", text: "risen" }, sender.token))
+      .body.ok
+  ).toBe(true);
+  const inbox = await post("/poll-messages", { id: reborn.id }, reborn.token);
+  expect((inbox.body.messages as any[]).map((m) => m.text)).toContain("risen");
+});
+
+test("a name held by a LIVE peer is still refused after the dead-peer change", async () => {
+  // The guard above must not become "anyone can take any name": liveness is the
+  // only thing that changed, so a living holder still wins.
+  const holder = await reg("/tmp/names-live-holder");
+  const rival = await reg("/tmp/names-live-rival");
+  expect((await post("/set-name", { id: holder.id, name: "occupied" }, holder.token)).body.ok).toBe(true);
+  const denied = await post("/set-name", { id: rival.id, name: "occupied" }, rival.token);
+  expect(denied.body.ok).toBe(false);
+  expect(String(denied.body.error)).toContain("taken");
+});
+
 test("invalid names are refused with the rule spelled out", async () => {
   const a = await reg("/tmp/names-e");
   for (const bad of ["", "   ", "-leading-dash", "a".repeat(33), "new\nline", "semi;colon"]) {

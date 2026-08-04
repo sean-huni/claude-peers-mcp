@@ -443,7 +443,7 @@ function prepareStatements() {
     // Case-insensitive: "Zod" and "zod" are one handle. The exclusion arm lets a
     // peer re-assert its own name without colliding with itself.
     selectPeerByName: db.prepare(`
-      SELECT id FROM peers WHERE name = ? COLLATE NOCASE AND id != ?
+      SELECT id, pid FROM peers WHERE name = ? COLLATE NOCASE AND id != ?
     `),
 
     // Wrapped rather than exposed raw, so every caller that removes a peer also drops its streams.
@@ -570,9 +570,21 @@ function handleSetName(body: SetNameRequest): SetNameResponse {
   if (!NAME_RULE.test(name)) {
     return { ok: false, error: "invalid: 1-32 chars, letters/digits/space/dash/underscore, must start alphanumeric" };
   }
-  const holder = stmts.selectPeerByName.get(name, body.id) as { id: string } | null;
+  const holder = stmts.selectPeerByName.get(name, body.id) as { id: string; pid: number } | null;
   if (holder) {
-    return { ok: false, error: `taken ${holder.id}` };
+    // A DEAD holder is not a holder. A session that restarts re-registers under a
+    // new id while its previous row survives until the next stale sweep, so
+    // without this a restarting session is refused its own name by its own
+    // corpse, for up to the sweep interval. That is precisely the window in
+    // which sessions restart, so it was the common case rather than the edge.
+    //
+    // Reap it here rather than waiting: cleanStalePeers would do exactly this,
+    // and doing it now keeps the name resolvable to the living peer immediately.
+    if (isProcessAlive(holder.pid)) {
+      return { ok: false, error: `taken ${holder.id}` };
+    }
+    stmts.deletePeer.run(holder.id);
+    noteDeletion(1);
   }
   stmts.updateName.run(name, body.id);
   return { ok: true };

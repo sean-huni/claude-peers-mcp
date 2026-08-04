@@ -17,7 +17,7 @@
  * every hook invocation. The MCP server already holds that token, already polls, and already knows
  * which session it belongs to. Writing a file it owns keeps the token where it is.
  *
- * IDENTIFYING A SESSION. Keyed on the pid of the `claude` process, which both sides can determine
+ * IDENTIFYING A SESSION. Keyed on the pid of the agent process, which both sides can determine
  * without agreeing on anything: the server is its child, and the hook is its descendant. Cwd is not
  * enough, because two sessions in one checkout is the normal case here, and that is exactly when
  * this matters most.
@@ -97,12 +97,21 @@ export function hasSpooled(sessionPid: number): boolean {
 }
 
 /**
- * The pid of the `claude` process this one belongs to.
+ * The pid of the agent session process this one belongs to.
  *
  * Walks the parent chain rather than reading a single level, because the caller may be a hook
- * running under a shell under Claude Code, and the depth is not fixed. Returns null rather than
+ * running under a shell under the agent, and the depth is not fixed. Returns null rather than
  * guessing: a wrong pid would write into another session's queue, which is worse than not
  * delivering.
+ *
+ * STOPS AT THE NEAREST AGENT, which is the whole reason this is a walk and not a search for
+ * `claude` specifically. A Codex session is very often started FROM a Claude Code session (a
+ * subagent shelling out, which is the normal way it happens here), so its process tree really does
+ * contain a live `claude` several levels up. Verified on darwin, codex-cli 0.145.0: the MCP server's
+ * parent is `codex` itself, and four levels above it sits the `claude` that spawned it. Walking past
+ * the `codex` to that `claude` does not fail loudly, it silently spools one agent's messages into
+ * another agent's context, which is precisely the misrouting the null-rather-than-guess rule exists
+ * to prevent.
  */
 export function findSessionPid(startPid: number = process.pid, maxDepth = 12): number | null {
   // Escape hatch for tests and for hosts where the process tree is not readable. Never set in a
@@ -117,7 +126,7 @@ export function findSessionPid(startPid: number = process.pid, maxDepth = 12): n
   for (let depth = 0; depth < maxDepth; depth++) {
     const parent = parentOf(pid);
     if (parent === null || parent <= 1) return null;
-    if (isClaude(parent)) return parent;
+    if (isAgentSession(parent)) return parent;
     pid = parent;
   }
   return null;
@@ -130,13 +139,25 @@ function parentOf(pid: number): number | null {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
-function isClaude(pid: number): boolean {
+/**
+ * The executables that constitute an agent session, and therefore a queue of their own.
+ *
+ * Both host this MCP server over stdio and both spawn it as a direct child, so either one being the
+ * nearest such ancestor identifies the session the server belongs to.
+ *
+ * Exact names only. `codex-fugu` is deliberately absent: it is the same CLI pointed at a different
+ * provider for one-shot second opinions, never a session that holds a peer identity, and matching it
+ * would hand a queue to a process that exits before anything could drain it.
+ */
+const AGENT_EXECUTABLES = /(^|\/)(claude|codex)$/;
+
+function isAgentSession(pid: number): boolean {
   const result = Bun.spawnSync(["ps", "-o", "command=", "-p", String(pid)]);
   const command = new TextDecoder().decode(result.stdout).trim();
-  // The binary, not merely the word: a shell whose command line MENTIONS claude, which is most of
-  // them in this estate, must not be mistaken for the session itself.
+  // The binary, not merely the word: a shell whose command line MENTIONS claude or codex, which is
+  // most of them in this estate, must not be mistaken for the session itself.
   const executable = command.split(/\s+/)[0] ?? "";
-  return /(^|\/)claude$/.test(executable);
+  return AGENT_EXECUTABLES.test(executable);
 }
 
 /** Removes queues belonging to sessions that are no longer running. */

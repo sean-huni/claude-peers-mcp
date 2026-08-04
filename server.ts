@@ -29,7 +29,7 @@ import type {
 } from "./shared/types.ts";
 import { fileURLToPath } from "node:url";
 import pkg from "./package.json";
-import { drainSpool, findSessionPid, spoolMessage, sweepDeadSpools } from "./spool";
+import { drainSpool, findHostSessionPid, spoolMessage, sweepDeadSpools } from "./spool";
 import { PollBackoff } from "./poll-backoff.ts";
 import {
   generateSummary,
@@ -710,10 +710,16 @@ function clientRendersChannel(): boolean {
 /**
  * The session this server belongs to, for spooled delivery.
  *
- * Resolved once: the parent cannot change, and re-deriving it on every cycle would run two `ps`
- * calls a second for the life of the session.
+ * Either host: this same server is started by Claude Code and by Codex, and it cannot know which
+ * from its own arguments. Resolving only `claude` here is the failure that makes the whole Codex
+ * path look plausible and deliver nothing: under Codex the walk finds no claude, the poll loop
+ * below bails out for want of anywhere to put a message, and the drain hook then runs on every turn
+ * against a queue that is empty because nothing ever wrote to it.
+ *
+ * Resolved once: the parent cannot change, and re-deriving it on every cycle would run a `ps` per
+ * ancestor per second for the life of the session.
  */
-const sessionPid: number | null = findSessionPid();
+const sessionPid: number | null = findHostSessionPid();
 
 /**
  * Retry schedule and log rate limiting for the loop below.

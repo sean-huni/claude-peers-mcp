@@ -1,10 +1,19 @@
-import { afterEach, beforeEach, expect, test, describe } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, statSync } from "node:fs";
+import { afterAll, afterEach, beforeEach, expect, test, describe } from "bun:test";
+import {
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+  existsSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   drainSpool,
+  findHostSessionPid,
   findSessionPid,
   hasSpooled,
   spoolMessage,
@@ -176,5 +185,115 @@ describe("finding the session", () => {
     // executable rather than the whole string is the only thing keeping this honest, and pid 1 is
     // a stable stand-in for "an ancestor that is not claude".
     expect(findSessionPid(1, 4)).toBeNull();
+  });
+});
+
+/**
+ * Resolving the host session under a REAL process tree.
+ *
+ * The producer half of the Codex path, and the half that is easy to leave out: everything else can
+ * be built and tested while nothing ever writes to the queue, and the symptom is a hook that runs
+ * on every turn and correctly reports that there is no mail.
+ *
+ * These build the tree rather than asserting about a regular expression. A `ps` reports the path a
+ * process was launched with, so a symlink to bun named `codex` IS a codex as far as this walk can
+ * tell, and that is exactly the thing under test.
+ */
+describe("finding the host session, whichever host it is", () => {
+  let dir: string;
+
+  /** A script that runs `argv` and relays its stdout, so the tree below can be built one level at a time. */
+  function relay(target: string[]): string {
+    return (
+      `const child = Bun.spawnSync(${JSON.stringify(target)}, { stdout: "pipe", stderr: "inherit" });\n` +
+      `process.stdout.write(child.stdout);\n`
+    );
+  }
+
+  function hostTree(): string {
+    if (!dir) {
+      dir = mkdtempSync(join(tmpdir(), "peers-hosts-"));
+      // Named exactly as the real binaries are, because the walk matches on the executable.
+      symlinkSync(process.execPath, join(dir, "codex"));
+      symlinkSync(process.execPath, join(dir, "claude"));
+
+      writeFileSync(
+        join(dir, "probe.ts"),
+        `import { findHostSessionPid, executableOf } from ${JSON.stringify(join(import.meta.dir, "spool"))};\n` +
+          `const pid = findHostSessionPid();\n` +
+          `console.log(JSON.stringify({ pid, exe: pid === null ? null : executableOf(pid) }));\n`
+      );
+      // The probe must be a CHILD of the host, never the host itself. `<dir>/codex probe.ts` is one
+      // process, not two: the walk starts at the parent and would sail straight past it, which is
+      // the real shape of the arrangement anyway, since an MCP server is spawned BY its host.
+      writeFileSync(join(dir, "spawn-probe.ts"), relay([process.execPath, join(dir, "probe.ts")]));
+      writeFileSync(
+        join(dir, "spawn-codex.ts"),
+        relay([join(dir, "codex"), join(dir, "spawn-probe.ts")])
+      );
+    }
+    return dir;
+  }
+
+  /** Env with the test escape hatch removed, so the walk has to do the real work. */
+  function realWalkEnv(): Record<string, string> {
+    const env = { ...process.env } as Record<string, string>;
+    delete env.CLAUDE_PEERS_SESSION_PID;
+    return env;
+  }
+
+  function runUnder(...argv: string[]): { pid: number | null; exe: string | null } {
+    const result = Bun.spawnSync(argv, { env: realWalkEnv(), stdout: "pipe", stderr: "pipe" });
+    const out = new TextDecoder().decode(result.stdout).trim();
+    const err = new TextDecoder().decode(result.stderr).trim();
+    // Fail closed and loudly. A crashed child prints nothing, and JSON.parse("") throwing here is
+    // the difference between a diagnosed failure and a test that quietly stops testing anything.
+    if (out.length === 0) throw new Error(`probe produced no output. stderr: ${err}`);
+    return JSON.parse(out);
+  }
+
+  afterAll(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("a codex ancestor is found, so a Codex session has somewhere to spool", () => {
+    // Without this the MCP server started by Codex resolves no session at all, the poll loop skips
+    // every message for want of anywhere to put it, and the drain hook empties a queue that nothing
+    // ever filled. The whole delivery path is then indistinguishable from working.
+    const home = hostTree();
+
+    const found = runUnder(join(home, "codex"), join(home, "spawn-probe.ts"));
+
+    expect(found.pid).not.toBeNull();
+    expect(found.exe).toMatch(/(^|\/)codex$/);
+  }, 30_000);
+
+  test("a claude ancestor is still found by the same walk", () => {
+    // The control for the test above. Teaching this walk about Codex must not cost it Claude Code,
+    // and losing that would be silent: every Claude session would simply stop spooling, which looks
+    // exactly like a quiet day.
+    const home = hostTree();
+
+    const found = runUnder(join(home, "claude"), join(home, "spawn-probe.ts"));
+
+    expect(found.pid).not.toBeNull();
+    expect(found.exe).toMatch(/(^|\/)claude$/);
+  }, 30_000);
+
+  test("the NEAREST host wins when a codex is running inside a claude", () => {
+    // A Codex session started from a Claude Code shell has both above it. The mail belongs to the
+    // codex turn whose hook will deliver it: resolving the outer claude would spool one session's
+    // messages into another session's queue, where the right hook never looks.
+    const home = hostTree();
+
+    const found = runUnder(join(home, "claude"), join(home, "spawn-codex.ts"));
+
+    expect(found.exe).toMatch(/(^|\/)codex$/);
+  }, 30_000);
+
+  test("neither host above us is still null rather than a guess", () => {
+    // pid 1 is launchd, and nothing above it is an agent session. A walk that returned some
+    // ancestor anyway would write into a queue belonging to nobody.
+    expect(findHostSessionPid(1, 4)).toBeNull();
   });
 });

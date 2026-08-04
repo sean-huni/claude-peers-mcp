@@ -17,10 +17,14 @@
  * every hook invocation. The MCP server already holds that token, already polls, and already knows
  * which session it belongs to. Writing a file it owns keeps the token where it is.
  *
- * IDENTIFYING A SESSION. Keyed on the pid of the `claude` process, which both sides can determine
- * without agreeing on anything: the server is its child, and the hook is its descendant. Cwd is not
- * enough, because two sessions in one checkout is the normal case here, and that is exactly when
- * this matters most.
+ * IDENTIFYING A SESSION. Keyed on the pid of the HOST process, `claude` or `codex`, which both
+ * sides can determine without agreeing on anything: the server is its child, and the hook is its
+ * descendant. Cwd is not enough, because two sessions in one checkout is the normal case here, and
+ * that is exactly when this matters most.
+ *
+ * The Codex half of the story, which events can carry a message and which cannot, is in
+ * codexdrain.ts. This file only has to know that a second host exists and key its queue the same
+ * way: see findHostSessionPid, and docs/codex-delivery.md.
  */
 import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -96,6 +100,17 @@ export function hasSpooled(sessionPid: number): boolean {
   return existsSync(spoolPath(sessionPid));
 }
 
+const CLAUDE = /(^|\/)claude$/;
+const CODEX = /(^|\/)codex$/;
+
+/**
+ * Every host agent that can own a queue.
+ *
+ * Both hosts spool into this one directory keyed on their own pid, so the only question a producer
+ * has to answer is which session it is running inside.
+ */
+const HOSTS = [CLAUDE, CODEX];
+
 /**
  * The pid of the `claude` process this one belongs to.
  *
@@ -105,6 +120,35 @@ export function hasSpooled(sessionPid: number): boolean {
  * delivering.
  */
 export function findSessionPid(startPid: number = process.pid, maxDepth = 12): number | null {
+  return findAgentSessionPid(CLAUDE, startPid, maxDepth);
+}
+
+/**
+ * The pid of the host agent session this process belongs to, whichever host that is.
+ *
+ * What the MCP server calls, because it is started by both and cannot know which. NEAREST ancestor
+ * wins, and that is a correctness rule rather than a shortcut: a Codex session launched from a
+ * Claude Code shell has BOTH above it, and the mail belongs to the codex turn whose hook will
+ * deliver it, not to the claude session that happened to spawn it. Checking every host at each
+ * level, rather than walking once per host, is what makes "nearest" mean nearest.
+ */
+export function findHostSessionPid(startPid: number = process.pid, maxDepth = 12): number | null {
+  return findAgentSessionPid(HOSTS, startPid, maxDepth);
+}
+
+/**
+ * The same walk, ending at a named executable.
+ *
+ * Codex sessions queue into the same spool and are found the same way, so the only thing that
+ * differs is which executable ends the walk. Kept as one function rather than two copies, because
+ * the subtle part is the executable-vs-command-line match below and a second copy of it would
+ * drift.
+ */
+export function findAgentSessionPid(
+  executable: RegExp | RegExp[],
+  startPid: number = process.pid,
+  maxDepth = 12
+): number | null {
   // Escape hatch for tests and for hosts where the process tree is not readable. Never set in a
   // real session: two sessions sharing this value would share a queue.
   const override = process.env.CLAUDE_PEERS_SESSION_PID;
@@ -113,11 +157,15 @@ export function findSessionPid(startPid: number = process.pid, maxDepth = 12): n
     if (!Number.isNaN(parsed)) return parsed;
   }
 
+  const wanted = Array.isArray(executable) ? executable : [executable];
   let pid = startPid;
   for (let depth = 0; depth < maxDepth; depth++) {
     const parent = parentOf(pid);
     if (parent === null || parent <= 1) return null;
-    if (isClaude(parent)) return parent;
+    // One `ps` per level, tested against every host, rather than one walk per host: two walks would
+    // return the OUTER match when both hosts are above us, which is the wrong session.
+    const exe = executableOf(parent);
+    if (wanted.some((pattern) => pattern.test(exe))) return parent;
     pid = parent;
   }
   return null;
@@ -130,21 +178,37 @@ function parentOf(pid: number): number | null {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
-function isClaude(pid: number): boolean {
+/**
+ * The executable a pid is running, or "" if it is gone.
+ *
+ * The binary, not merely the word: a shell whose command line MENTIONS claude, which is most of
+ * them in this estate, must not be mistaken for the session itself.
+ */
+export function executableOf(pid: number): string {
   const result = Bun.spawnSync(["ps", "-o", "command=", "-p", String(pid)]);
   const command = new TextDecoder().decode(result.stdout).trim();
-  // The binary, not merely the word: a shell whose command line MENTIONS claude, which is most of
-  // them in this estate, must not be mistaken for the session itself.
-  const executable = command.split(/\s+/)[0] ?? "";
-  return /(^|\/)claude$/.test(executable);
+  return command.split(/\s+/)[0] ?? "";
 }
 
-/** Removes queues belonging to sessions that are no longer running. */
+/** Whether a live pid is running the named executable. False for a pid that is gone. */
+export function executableMatches(pid: number, executable: RegExp): boolean {
+  const exe = executableOf(pid);
+  return exe !== "" && executable.test(exe);
+}
+
+/**
+ * Removes everything belonging to sessions that are no longer running.
+ *
+ * BOTH files a session leaves here: the queue itself and the `.seen` activity stamp the Codex hook
+ * writes beside it. Sweeping only the queue leaks one stamp per session that ever ran a hook, in a
+ * directory nothing else tidies, and the leak is invisible because a stale stamp is 13 bytes and
+ * changes no behaviour.
+ */
 export function sweepDeadSpools(): void {
   const dir = spoolDir();
   if (!existsSync(dir)) return;
-  for (const entry of new Bun.Glob("*.jsonl").scanSync(dir)) {
-    const pid = Number.parseInt(entry.replace(/\.jsonl$/, ""), 10);
+  for (const entry of new Bun.Glob("*.{jsonl,seen}").scanSync(dir)) {
+    const pid = Number.parseInt(entry.replace(/\.(jsonl|seen)$/, ""), 10);
     if (Number.isNaN(pid)) continue;
     try {
       process.kill(pid, 0);

@@ -63,7 +63,7 @@ The other Claude receives it immediately and responds.
 
 | Tool             | What it does                                                                   |
 | ---------------- | ------------------------------------------------------------------------------ |
-| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` |
+| `list_peers`     | Find other Claude Code instances, scoped to `machine`, `directory`, or `repo` |
 | `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)  |
 | `broadcast_message` | Send one message to every other instance in scope at once (see below)       |
 | `set_summary`    | Describe what you're working on (visible to other peers)                       |
@@ -202,6 +202,34 @@ Notes on the design:
 - **Only one path ever fires.** With the channel on, nothing is spooled, so a message is never
   delivered twice.
 - Queues belonging to exited sessions are swept at startup, because pids are reused.
+
+## Delivery into a Codex CLI session
+
+Codex has no channel at all, so it always takes the spooled path. Its hooks are not interchangeable
+with Claude Code's: of its eleven events only seven can put text in front of the model, and a drain
+wired to one of the other four would look like it worked, empty the queue, and deliver nothing.
+
+```bash
+bun bin/install-codex-hook.ts --dry-run   # print what would be written to $CODEX_HOME/hooks.json
+bun bin/install-codex-hook.ts             # then start codex and approve the hook once
+```
+
+Three events are registered. `Stop` is the one that matters: it fires when a turn completes, and a
+hook answering `{"decision":"block","reason":"..."}` refuses to let the turn end and feeds the reason
+back, which is how mail reaches a session nobody is typing into. `UserPromptSubmit` and
+`SessionStart` are the cheap moments where mail is already on the way in.
+
+**Codex will not run the hook until you approve it.** It records a hash of `hooks.json` in
+`config.toml` and asks at startup whenever that hash changes.
+
+**One case is still not covered: a session sitting idle at the prompt.** No event fires while a
+session waits for input, and `codex exec resume` runs a separate process against the same rollout
+file rather than reaching the open TUI. `bun cli.ts codex-nudge-status` reports which sessions are in
+that state; it never drains, because draining from outside would consume the message without ever
+showing it to the model.
+
+The event table, the schemas it was read from, and the two halves of the path are in
+[docs/codex-delivery.md](docs/codex-delivery.md).
 
 ## Losing the database
 
@@ -345,4 +373,4 @@ Then exit and relaunch each Claude Code session
 
 - [Bun](https://bun.sh)
 - Claude Code v2.1.80+
-- claude.ai login (channels require it — API key auth won't work)
+- claude.ai login (channels require it; API key auth will not work)

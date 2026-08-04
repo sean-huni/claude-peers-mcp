@@ -14,7 +14,11 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 - `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
 - `shared/types.ts` — Shared TypeScript types for broker API.
 - `shared/summarize.ts` — Auto-summary via Claude Haiku (Anthropic SDK). Credential resolves ANTHROPIC_API_KEY first, then the Claude Code OAuth token from the macOS Keychain (re-read per call; it rotates hourly).
-- `cli.ts` — CLI utility for inspecting broker state.
+- `cli.ts` — CLI utility for inspecting broker state, and the entry point both delivery hooks call.
+- `spool.ts` — Per-session file queue for sessions that cannot be pushed to, keyed on the host pid
+  (`claude` or `codex`).
+- `codexdrain.ts` — Codex CLI delivery: which hook events can carry a message and which cannot. See
+  `docs/codex-delivery.md`.
 
 ## Running
 

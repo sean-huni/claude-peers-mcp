@@ -63,11 +63,52 @@ The other Claude receives it immediately and responds.
 
 | Tool             | What it does                                                                   |
 | ---------------- | ------------------------------------------------------------------------------ |
-| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` |
-| `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)  |
+| `list_peers`     | Find other Claude Code instances, scoped to `machine`, `directory`, or `repo`  |
+| `send_message`   | Send a message to another instance by ID or name (arrives instantly via channel push) |
+| `ask_peer`       | Ask another instance a question and WAIT for its answer, up to a timeout (see below) |
 | `broadcast_message` | Send one message to every other instance in scope at once (see below)       |
 | `set_summary`    | Describe what you're working on (visible to other peers)                       |
+| `set_name`       | Claim a human-readable peer name, addressable by `send_message` (see below)    |
+| `whoami`         | Report this session's own ID, name, cwd, repo, and summary                     |
 | `check_messages` | Manually check for messages (fallback if not using channel mode)               |
+
+## Peer names
+
+A session can claim a name and be addressed by it, so "send this to zod" works without anyone
+copying 8-char IDs around:
+
+```
+User: your peer name is Zod
+Claude: [calls set_name("Zod")] Name claimed.
+
+# in any other session:
+Claude: [calls send_message(to_id: "zod", ...)]   # case-insensitive
+```
+
+- Claim at launch with `CLAUDE_PEERS_NAME=Zod` in the environment, or at any time with the
+  `set_name` tool.
+- Names are 1-32 chars (letters, digits, space, dash, underscore, starting alphanumeric) and
+  **unique per broker, case-insensitively**: claiming a name another live peer holds fails with
+  `taken <id>`. Uniqueness at claim time is what keeps send-time resolution unambiguous.
+- Renaming requires the peer's own bearer token: a name is a routable address, so an
+  unauthenticated rename would redirect that peer's inbound mail.
+- `list_peers` shows names; inbound pushes carry the sender's name in `meta.from_name`.
+- IDs keep working everywhere a name works. On a collision (`Peer x not found`, `taken ...`),
+  fall back to the ID from `list_peers`.
+
+## Asking and waiting: `ask_peer`
+
+`send_message` is fire-and-forget. `ask_peer(to_id, question, timeout_seconds?)` blocks until the
+peer answers or the timeout lapses (default 60s, 5-300):
+
+- The peer receives the question as a normal message with reply instructions embedded: it answers
+  with `send_message(..., in_reply_to: "<ask token>")`, and that answer resolves the waiting call.
+- The answer is consumed by the waiting `ask_peer` call and is **not** also delivered as a second
+  inbound message.
+- No answer in time returns a timeout notice; the question was still delivered, and a late answer
+  arrives as an ordinary message rather than vanishing.
+- Use `ask_peer` when the answer gates your next step (a decision, a value, a confirmation);
+  use `send_message` for everything else.
 
 ## Broadcasting
 
@@ -345,4 +386,4 @@ Then exit and relaunch each Claude Code session
 
 - [Bun](https://bun.sh)
 - Claude Code v2.1.80+
-- claude.ai login (channels require it — API key auth won't work)
+- claude.ai login (channels require it; API key auth won't work)

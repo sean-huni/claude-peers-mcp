@@ -145,6 +145,7 @@ switch (cmd) {
           git_root: string | null;
           tty: string | null;
           summary: string;
+          name: string | null;
           last_seen: string;
         }>
       >("/list-peers", {
@@ -158,7 +159,8 @@ switch (cmd) {
         console.log("No peers registered.");
       } else {
         for (const p of peers) {
-          const parts = [`${p.id}  PID:${p.pid}  ${p.cwd}`];
+          const label = p.name ? `${p.id} (${p.name})` : p.id;
+          const parts = [`${label}  PID:${p.pid}  ${p.cwd}`];
           if (p.summary) parts.push(`  Summary: ${p.summary}`);
           console.log(parts.join("\n"));
         }

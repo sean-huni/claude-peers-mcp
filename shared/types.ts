@@ -8,6 +8,8 @@ export interface Peer {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  // Human-chosen handle ("zod"), unique among registered peers, or null when unnamed.
+  name: string | null;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
 }
@@ -45,6 +47,18 @@ export interface SetSummaryRequest {
   summary: string;
 }
 
+export interface SetNameRequest {
+  id: PeerId;
+  name: string;
+}
+
+export interface SetNameResponse {
+  ok: boolean;
+  // Set when ok is false: "invalid" (fails the charset/length rule) or "taken <id>"
+  // (another registered peer holds the name).
+  error?: string;
+}
+
 export interface ListPeersRequest {
   scope: "machine" | "directory" | "repo";
   // The requesting peer's context (used for filtering)
@@ -55,7 +69,8 @@ export interface ListPeersRequest {
 
 export interface SendMessageRequest {
   from_id: PeerId;
-  to_id: PeerId;
+  // A peer id, or a peer name: the broker resolves names to ids at delivery time.
+  to_id: PeerId | string;
   text: string;
 }
 

@@ -12,11 +12,12 @@
  */
 
 import { test, expect, afterAll } from "bun:test";
-import { rmSync, mkdtempSync, realpathSync } from "node:fs";
+import { rmSync } from "node:fs";
+import { cleanupTempDirs, reserveFreePort, trackedTempDir } from "./testsupport";
 
-// Assigned port range for this suite: 7860-7869. Never 7899, which is a live
-// broker owned by the user.
-const PORT = 7860 + Math.floor(Math.random() * 10);
+// Reserved from the shared pool. See recovery.test.ts for why a private hardcoded
+// range is a trap.
+const PORT = reserveFreePort();
 const DB = `${process.env.TMPDIR ?? "/tmp"}/claude-peers-logtest-${PORT}.db`;
 const BASE = `http://127.0.0.1:${PORT}`;
 const ENV = {
@@ -104,9 +105,10 @@ async function waitForLine(lines: string[], re: RegExp, timeoutMs: number): Prom
 }
 
 function workdir(): string {
-  return realpathSync(
-    mkdtempSync(`${(process.env.TMPDIR ?? "/tmp").replace(/\/$/, "")}/peers-logtest-`)
-  );
+  // trackedTempDir, not a raw mkdtempSync: the raw version was never registered for
+  // cleanup and this suite's afterAll only removed the database files, so every run
+  // since 2026-08-03 left one directory behind. Ninety-six had accumulated.
+  return trackedTempDir("peers-logtest-");
 }
 
 /** Lines the outage is responsible for. */
@@ -124,6 +126,7 @@ afterAll(() => {
     }
   }
   for (const suffix of ["", "-wal", "-shm"]) rmSync(`${DB}${suffix}`, { force: true });
+  cleanupTempDirs();
 });
 
 test("a dead broker does not flood the MCP log, and recovery is announced", async () => {

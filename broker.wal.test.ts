@@ -14,10 +14,11 @@
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { readFileSync, existsSync, rmSync, statSync } from "node:fs";
+import { reserveFreePort } from "./testsupport";
 
-// Assigned port range for this suite: 7850-7859. Never 7899, which is a live
-// broker owned by the user.
-const PORT = 7850 + Math.floor(Math.random() * 10);
+// Reserved from the shared pool. See recovery.test.ts for why a private hardcoded
+// range is a trap: widening the pool over it turns every run into a coin flip.
+const PORT = reserveFreePort();
 const DB = `${process.env.TMPDIR ?? "/tmp"}/claude-peers-waltest-${PORT}.db`;
 const BASE = `http://127.0.0.1:${PORT}`;
 const SUFFIXES = ["", "-wal", "-shm"];

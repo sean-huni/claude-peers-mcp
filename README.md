@@ -411,7 +411,7 @@ the override points.
 
 **Test-only.** These exist so a test run cannot collide with a live session, and are not
 meant for normal use: `CLAUDE_PEERS_SESSION_PID` (pin the host session instead of walking the
-process tree), `CLAUDE_PEERS_TEST_PORT_MIN` / `CLAUDE_PEERS_TEST_PORT_MAX` (default `7810`-`7824`,
+process tree), `CLAUDE_PEERS_TEST_PORT_MIN` / `CLAUDE_PEERS_TEST_PORT_MAX` (default `7830`-`7889`,
 the range suites draw ports from, deliberately excluding the live `7899`).
 
 

@@ -281,6 +281,32 @@ Codex session runs `server.ts`, the same file a Claude session runs.
 That is possible because `codex mcp add` exists, so Codex consumes MCP servers over stdio like any
 other host. Verified on darwin with codex-cli 0.145.0.
 
+### Codex asks before it calls a tool, and headless runs answer "no"
+
+The first thing that looks like a broken integration is not one. Codex gates every MCP tool call
+behind an approval, and a session with nobody to ask denies it:
+
+```
+mcp: claude-peers/list_peers started
+mcp: claude-peers/list_peers (failed)
+user cancelled MCP tool call
+```
+
+That message is Codex refusing on your behalf. The server is healthy: it starts, registers,
+answers `initialize` and `tools/list`, and simply never receives `tools/call`. Reproduced on
+codex-cli 0.145.0 (2026-08-05) by probing the server with a handler that logs every request.
+
+- **Interactive sessions** get the prompt. Choose "Allow and don't ask me again" once and peering
+  works from then on. This is the normal path and needs no configuration.
+- **`codex exec` (headless)** denies under every `approval_policy` value tested: `never`,
+  `on-request`, `on-failure`, `untrusted`. The per-server `default_tools_approval_mode` and the
+  per-tool `approval_mode` keys did not change the outcome either. The only thing that worked was
+  `--dangerously-bypass-approvals-and-sandbox`, which is exactly as broad as it sounds. Use it only
+  where the environment is already sandboxed.
+
+If tool calls fail with `user cancelled` and you never saw a prompt, this is why, and no amount of
+debugging the broker will help.
+
 ### Setup
 
 ```bash

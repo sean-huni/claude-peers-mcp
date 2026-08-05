@@ -28,7 +28,15 @@
  * rather than papering over it. See docs/codex-delivery.md.
  */
 
-import { drainSpool, findAgentSessionPid, hasSpooled, spoolDir, type SpooledMessage } from "./spool";
+import {
+  drainSpool,
+  findAgentSessionPid,
+  foreignLiveSpools,
+  hasSpooled,
+  spoolDir,
+  spoolPath,
+  type SpooledMessage,
+} from "./spool";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -122,6 +130,32 @@ export function findCodexSessionPid(startPid: number = process.pid): number | nu
 }
 
 /**
+ * An empty queue is the normal case, and is reported as nothing. A DIVERGENT queue is not.
+ *
+ * If this hook resolved host pid A while the MCP server resolved host pid B, mail lands in B's
+ * file and this drain reads A's. The queue here stays empty forever, the hook keeps exiting 0
+ * with valid JSON, and the messages pile up in a file nobody reads. That is indistinguishable
+ * from "no mail" unless somebody looks, so look: any OTHER live session's queue holding
+ * messages, while ours is empty, is the signature.
+ *
+ * Reported through the same delivery channel the mail would have used, because a warning on
+ * stderr is a warning nobody sees.
+ */
+function reportEmptyOrDivergence(pid: number, mode: DeliveryMode, event: string): string {
+  const foreign = foreignLiveSpools(pid);
+  if (foreign.length === 0) return "{}";
+  const detail = foreign.map((f) => `pid ${f.pid} (${f.count} message(s))`).join(", ");
+  return renderDelivery(
+    mode,
+    event,
+    `claude-peers: this session resolved host pid ${pid} and its queue (${spoolPath(pid)}) is empty, ` +
+      `but ${detail} belongs to another LIVE session and is not. The producer and this hook ` +
+      `disagree about which session owns this queue, so mail is being written where nothing reads it. ` +
+      `Check that the MCP server and this hook share the same codex ancestor.`
+  );
+}
+
+/**
  * The whole hook path: decide, drain, render.
  *
  * The ordering is the contract. Delivery mode is settled BEFORE the queue is touched, so an event
@@ -145,7 +179,7 @@ export function drainForHook(raw: string, sessionPid?: number | null): string {
   if (mode === "none") return "{}";
 
   // Cheap check first: the common case is an empty queue on every tool call.
-  if (!hasSpooled(pid)) return "{}";
+  if (!hasSpooled(pid)) return reportEmptyOrDivergence(pid, mode, input.hook_event_name);
 
   const messages = drainSpool(pid);
   if (messages.length === 0) return "{}";

@@ -207,6 +207,41 @@ export function executableMatches(pid: number, executable: RegExp): boolean {
  * directory nothing else tidies, and the leak is invisible because a stale stamp is 13 bytes and
  * changes no behaviour.
  */
+/**
+ * Queue files that exist, are non-empty, and belong to a LIVING process other than `mine`.
+ *
+ * This exists to make one specific failure visible. The producer (the MCP server, walking its
+ * ancestors) and the consumer (the delivery hook, walking its own) each resolve a host pid
+ * independently. When those two answers differ, mail is written to one file and read from
+ * another: the hook reports "no mail" forever, exits 0 with valid JSON, and looks perfectly
+ * healthy while the queue grows beside it. Nothing in the system notices, because every
+ * component is behaving exactly as designed.
+ *
+ * Returning the other live queues lets the caller say so out loud instead.
+ */
+export function foreignLiveSpools(mine: number | null): { pid: number; count: number }[] {
+  const dir = spoolDir();
+  if (!existsSync(dir)) return [];
+  const found: { pid: number; count: number }[] = [];
+  for (const entry of new Bun.Glob("*.jsonl").scanSync(dir)) {
+    const pid = Number.parseInt(entry.replace(/\.jsonl$/, ""), 10);
+    if (Number.isNaN(pid) || pid === mine) continue;
+    try {
+      // A dead session's leftovers are sweepDeadSpools' problem, not a divergence.
+      process.kill(pid, 0);
+    } catch {
+      continue;
+    }
+    try {
+      const lines = readFileSync(join(dir, entry), "utf8").split("\n").filter((l) => l.trim());
+      if (lines.length > 0) found.push({ pid, count: lines.length });
+    } catch {
+      // Unreadable is not evidence of divergence.
+    }
+  }
+  return found;
+}
+
 export function sweepDeadSpools(): void {
   const dir = spoolDir();
   if (!existsSync(dir)) return;

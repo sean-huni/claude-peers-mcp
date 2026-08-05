@@ -29,7 +29,14 @@ import type {
 } from "./shared/types.ts";
 import { fileURLToPath } from "node:url";
 import pkg from "./package.json";
-import { drainSpool, findHostSessionPid, spoolMessage, sweepDeadSpools } from "./spool";
+import {
+  drainSpool,
+  executableOf,
+  findHostSessionPid,
+  spoolMessage,
+  spoolPath,
+  sweepDeadSpools,
+} from "./spool";
 import { PollBackoff } from "./poll-backoff.ts";
 import {
   generateSummary,
@@ -973,6 +980,15 @@ function clientRendersChannel(): boolean {
  * ancestor per second for the life of the session.
  */
 const sessionPid: number | null = findHostSessionPid();
+// Logged because the consumer resolves this SAME number independently, by walking its own
+// ancestors, and the two answers must agree or mail is written to one queue and read from
+// another. Printing it on both sides is what makes a mismatch findable in a log rather than
+// something you deduce from mail that never arrives.
+log(
+  sessionPid === null
+    ? "Host session: none resolved (no claude/codex ancestor); channel push only"
+    : `Host session pid ${sessionPid} (${executableOf(sessionPid) || "unknown"}) -> queue ${spoolPath(sessionPid)}`
+);
 
 /**
  * Retry schedule and log rate limiting for the loop below.

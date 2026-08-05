@@ -112,6 +112,7 @@ switch (cmd) {
             git_root: string | null;
             tty: string | null;
             summary: string;
+            name: string | null;
             last_seen: string;
           }>
         >("/list-peers", {
@@ -123,7 +124,7 @@ switch (cmd) {
 
         console.log("\nPeers:");
         for (const p of peers) {
-          console.log(`  ${p.id}  PID:${p.pid}  ${p.cwd}`);
+          console.log(`  ${p.name ? `${p.id} (${p.name})` : p.id}  PID:${p.pid}  ${p.cwd}`);
           if (p.summary) console.log(`         ${p.summary}`);
           if (p.tty) console.log(`         TTY: ${p.tty}`);
           console.log(`         Last seen: ${p.last_seen}`);

@@ -206,7 +206,7 @@ no reason to do. A messaging system whose delivery depends on the recipient gues
 something arrived is not a messaging system.
 
 So when the channel is unavailable the poll loop writes each message to a per-session queue under
-`~/.claude-peers/inbox/<claude-pid>.jsonl`, and a hook drains it into the session:
+`~/.claude-peers/inbox/<agent-pid>.jsonl`, and a hook drains it into the session:
 
 ```jsonc
 // ~/.claude/settings.json
@@ -232,8 +232,9 @@ session.
 
 Notes on the design:
 
-- **The queue is keyed on the `claude` process id**, not on the working directory. Two sessions in
-  one checkout is the normal case, and it is exactly when misrouting would matter.
+- **The queue is keyed on the agent process id** (`claude` or `codex`), not on the working
+  directory. Two sessions in one checkout is the normal case, and it is exactly when misrouting
+  would matter.
 - **The hook never touches the broker.** It reads a local file, so it needs no peer identity and no
   auth token; handing one to every hook invocation would put a credential that can read a session's
   messages into every tool call.
@@ -242,6 +243,124 @@ Notes on the design:
 - **Only one path ever fires.** With the channel on, nothing is spooled, so a message is never
   delivered twice.
 - Queues belonging to exited sessions are swept at startup, because pids are reused.
+
+## Delivery into a Codex CLI session
+
+Codex has no channel at all, so it always takes the spooled path. Its hooks are not interchangeable
+with Claude Code's: of its eleven events only seven can put text in front of the model, and a drain
+wired to one of the other four would look like it worked, empty the queue, and deliver nothing.
+
+```bash
+bun bin/install-codex-hook.ts --dry-run   # print what would be written to $CODEX_HOME/hooks.json
+bun bin/install-codex-hook.ts             # then start codex and approve the hook once
+```
+
+Three events are registered. `Stop` is the one that matters: it fires when a turn completes, and a
+hook answering `{"decision":"block","reason":"..."}` refuses to let the turn end and feeds the reason
+back, which is how mail reaches a session nobody is typing into. `UserPromptSubmit` and
+`SessionStart` are the cheap moments where mail is already on the way in.
+
+**Codex will not run the hook until you approve it.** It records a hash of `hooks.json` in
+`config.toml` and asks at startup whenever that hash changes.
+
+**One case is still not covered: a session sitting idle at the prompt.** No event fires while a
+session waits for input, and `codex exec resume` runs a separate process against the same rollout
+file rather than reaching the open TUI. `bun cli.ts codex-nudge-status` reports which sessions are in
+that state; it never drains, because draining from outside would consume the message without ever
+showing it to the model.
+
+The event table, the schemas it was read from, and the two halves of the path are in
+[docs/codex-delivery.md](docs/codex-delivery.md).
+
+## Codex sessions as peers
+
+A Codex CLI session joins the same network, is listed by `list_peers` beside every Claude session,
+and sends and receives normally. There is no Codex adapter and no second server implementation: a
+Codex session runs `server.ts`, the same file a Claude session runs.
+
+That is possible because `codex mcp add` exists, so Codex consumes MCP servers over stdio like any
+other host. Verified on darwin with codex-cli 0.145.0.
+
+### Codex asks before it calls a tool, and headless runs answer "no"
+
+The first thing that looks like a broken integration is not one. Codex gates every MCP tool call
+behind an approval, and a session with nobody to ask denies it:
+
+```
+mcp: claude-peers/list_peers started
+mcp: claude-peers/list_peers (failed)
+user cancelled MCP tool call
+```
+
+That message is Codex refusing on your behalf. The server is healthy: it starts, registers,
+answers `initialize` and `tools/list`, and simply never receives `tools/call`. Reproduced on
+codex-cli 0.145.0 (2026-08-05) by probing the server with a handler that logs every request.
+
+- **Interactive sessions** get the prompt. Choose "Allow and don't ask me again" once and peering
+  works from then on. This is the normal path and needs no configuration.
+- **`codex exec` (headless)** denies under every `approval_policy` value tested: `never`,
+  `on-request`, `on-failure`, `untrusted`. The per-server `default_tools_approval_mode` and the
+  per-tool `approval_mode` keys did not change the outcome either. The only thing that worked was
+  `--dangerously-bypass-approvals-and-sandbox`, which is exactly as broad as it sounds. Use it only
+  where the environment is already sandboxed.
+
+If tool calls fail with `user cancelled` and you never saw a prompt, this is why, and no amount of
+debugging the broker will help.
+
+### Setup
+
+```bash
+codex mcp add claude-peers \
+  --env CLAUDE_PEERS_CHANNEL=never \
+  -- bun /absolute/path/to/claude-peers-mcp/server.ts
+```
+
+The path must be absolute. Codex launches the server from the session's working directory, not from
+this checkout.
+
+`CLAUDE_PEERS_CHANNEL=never` is belt and braces rather than a requirement. Channel push is a Claude
+Code feature, and detection already reads the parent process's argv, which under Codex is
+`codex ...` and carries no `--dangerously-load-development-channels` flag. Setting it explicitly
+states the intent and saves one `ps` call per session.
+
+### Verify it worked
+
+```bash
+codex mcp get claude-peers      # the entry, its command and its env
+bun cli.ts peers                # the Codex session appears once it has registered
+```
+
+Then ask the Codex session to call `list_peers`, and a Claude session to `send_message` to the id it
+reports.
+
+### What differs, and what it cost
+
+Three signals are Claude-shaped. Each already had an environment seam, but only two of them can
+actually carry it:
+
+| Signal | Seam | Works under Codex |
+| ------ | ---- | ----------------- |
+| Channel push | `CLAUDE_PEERS_CHANNEL` | Yes, and detection gets it right unset |
+| Spool directory | `CLAUDE_PEERS_SPOOL_DIR` | Yes, a static path |
+| Session identity | `CLAUDE_PEERS_SESSION_PID` | **No** |
+
+The third one does not work, and that is the one change this needed. Codex passes `env` values from
+`config.toml` **literally**: `CLAUDE_PEERS_SESSION_PID=$PPID` arrives at the server as the five
+characters `$PPID`, and a session's pid is not knowable when the entry is written anyway. So the
+identity has to come from the process tree, as it always did for Claude.
+
+Left alone, the walk did not merely fail to find a session. **It found the wrong one.** A Codex
+session is usually started from a Claude Code session, so its tree contains a live `claude` a few
+levels above the `codex`, and the walk kept going until it reached it. Nothing errors: one agent's
+messages are appended to another agent's queue and drained into that agent's context.
+
+The fix is one predicate in `spool.ts`: the walk stops at the nearest `claude` **or** `codex`
+ancestor instead of searching for `claude` alone. Everything else, including `server.ts`, is
+unchanged.
+
+Note on delivery: registration, discovery, `send_message` and `check_messages` all work, and inbound
+messages are queued correctly under the Codex session's own id. Surfacing a queued message to an
+idle Codex session is a separate transport problem and is not solved here.
 
 ## Losing the database
 
@@ -443,3 +562,4 @@ Then exit and relaunch each Claude Code session
 - [Bun](https://bun.sh)
 - Claude Code v2.1.80+
 - claude.ai login (channels require it; API key auth won't work)
+- Optional, for Codex peers: Codex CLI v0.145.0+ (`codex mcp add`)

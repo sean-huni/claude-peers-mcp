@@ -21,8 +21,14 @@ import { listeningBrokerPids } from "./shared/procs";
 
 type Proc = { pid: number; kill: (signal?: number | NodeJS.Signals) => void };
 
-const PORT_MIN = Number.parseInt(process.env.CLAUDE_PEERS_TEST_PORT_MIN ?? "7810", 10);
-const PORT_MAX = Number.parseInt(process.env.CLAUDE_PEERS_TEST_PORT_MAX ?? "7824", 10);
+// 7830-7889: sixty ports for a suite that currently reserves fifteen. The old 7810-7824 window
+// held exactly as many ports as there were callers, so the next test file to reserve one failed
+// the whole run with "no free port" (hit 2026-08-05 when the Codex branch was integrated). The
+// range deliberately starts above 7826, which hygiene.test.ts squats on purpose to prove
+// exhaustion is reported rather than silently returning an occupied port, and ends well below
+// the production broker on 7899.
+const PORT_MIN = Number.parseInt(process.env.CLAUDE_PEERS_TEST_PORT_MIN ?? "7830", 10);
+const PORT_MAX = Number.parseInt(process.env.CLAUDE_PEERS_TEST_PORT_MAX ?? "7889", 10);
 
 const handedOut = new Set<number>();
 const trackedDirs = new Set<string>();

@@ -108,7 +108,62 @@ function openDatabase(): Database {
   );
   if (!msgCols.has("reply_to")) handle.run("ALTER TABLE messages ADD COLUMN reply_to TEXT");
 
+  createNameUniqueIndex(handle);
+
   return handle;
+}
+
+/**
+ * Enforce name uniqueness in the SCHEMA, not just in handleSetName.
+ *
+ * handleSetName reads then writes, which is only atomic because Bun.serve runs
+ * one JS thread and bun:sqlite is synchronous. That is a property of today's
+ * runtime, not a declared invariant: add `reusePort`, a worker, or a single
+ * `await` between the check and the write, and two callers can both pass the
+ * check and both claim the name. Since a name is a routable address, the
+ * consequence is not a cosmetic duplicate, it is a message delivered to an
+ * arbitrary one of two peers.
+ *
+ * PARTIAL index (`WHERE name IS NOT NULL`) because unnamed peers are the common
+ * case and SQLite would otherwise treat every NULL as distinct anyway; being
+ * explicit says the intent. COLLATE NOCASE so it agrees with the lookup, which
+ * is also case-insensitive: an index with different collation than the query
+ * would be silently unused AND would not enforce the rule anybody relies on.
+ */
+function createNameUniqueIndex(handle: Database): void {
+  const create = () =>
+    handle.run(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_peers_name_unique
+         ON peers(name COLLATE NOCASE) WHERE name IS NOT NULL`
+    );
+  try {
+    create();
+  } catch {
+    // A database written before this index existed can already hold duplicates.
+    // Refusing to boot over old data would be worse than the duplicates are, so
+    // resolve them: the earliest registration keeps the name and the rest are
+    // un-named. They are still reachable by id, and a live session re-claims its
+    // name on its next set_name.
+    handle.run(`
+      UPDATE peers SET name = NULL
+      WHERE name IS NOT NULL
+        AND id NOT IN (
+          SELECT id FROM peers p2
+          WHERE p2.name IS NOT NULL
+            AND p2.registered_at = (
+              SELECT MIN(p3.registered_at) FROM peers p3
+              WHERE p3.name = p2.name COLLATE NOCASE
+            )
+          GROUP BY p2.name COLLATE NOCASE
+        )
+    `);
+    create();
+    console.error(
+      "[claude-peers broker] duplicate peer names found in an existing database; " +
+        "kept the earliest registration for each and cleared the rest. Affected sessions " +
+        "re-claim their name on their next set_name."
+    );
+  }
 }
 
 let db = openDatabase();
@@ -586,7 +641,18 @@ function handleSetName(body: SetNameRequest): SetNameResponse {
     stmts.deletePeer.run(holder.id);
     noteDeletion(1);
   }
-  stmts.updateName.run(name, body.id);
+  try {
+    stmts.updateName.run(name, body.id);
+  } catch (e) {
+    // The unique index caught what the check above could not: another caller
+    // claimed this name between the read and the write. Impossible on today's
+    // single-threaded runtime, which is exactly why it must not be a 500 the
+    // day that changes. Same verdict a losing caller gets from the check.
+    if (/UNIQUE constraint failed/i.test(e instanceof Error ? e.message : String(e))) {
+      return { ok: false, error: "taken (lost a concurrent claim)" };
+    }
+    throw e;
+  }
   return { ok: true };
 }
 

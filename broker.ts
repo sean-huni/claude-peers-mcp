@@ -17,6 +17,8 @@ import type {
   RegisterResponse,
   HeartbeatRequest,
   SetSummaryRequest,
+  SetNameRequest,
+  SetNameResponse,
   ListPeersRequest,
   SendMessageRequest,
   BroadcastMessageRequest,
@@ -87,6 +89,7 @@ function openDatabase(): Database {
       text TEXT NOT NULL,
       sent_at TEXT NOT NULL,
       delivered INTEGER NOT NULL DEFAULT 0,
+      reply_to TEXT,
       FOREIGN KEY (from_id) REFERENCES peers(id),
       FOREIGN KEY (to_id) REFERENCES peers(id)
     )
@@ -98,8 +101,69 @@ function openDatabase(): Database {
     (handle.query("PRAGMA table_info(peers)").all() as { name: string }[]).map((c) => c.name)
   );
   if (!existing.has("token")) handle.run("ALTER TABLE peers ADD COLUMN token TEXT");
+  if (!existing.has("name")) handle.run("ALTER TABLE peers ADD COLUMN name TEXT");
+
+  const msgCols = new Set(
+    (handle.query("PRAGMA table_info(messages)").all() as { name: string }[]).map((c) => c.name)
+  );
+  if (!msgCols.has("reply_to")) handle.run("ALTER TABLE messages ADD COLUMN reply_to TEXT");
+
+  createNameUniqueIndex(handle);
 
   return handle;
+}
+
+/**
+ * Enforce name uniqueness in the SCHEMA, not just in handleSetName.
+ *
+ * handleSetName reads then writes, which is only atomic because Bun.serve runs
+ * one JS thread and bun:sqlite is synchronous. That is a property of today's
+ * runtime, not a declared invariant: add `reusePort`, a worker, or a single
+ * `await` between the check and the write, and two callers can both pass the
+ * check and both claim the name. Since a name is a routable address, the
+ * consequence is not a cosmetic duplicate, it is a message delivered to an
+ * arbitrary one of two peers.
+ *
+ * PARTIAL index (`WHERE name IS NOT NULL`) because unnamed peers are the common
+ * case and SQLite would otherwise treat every NULL as distinct anyway; being
+ * explicit says the intent. COLLATE NOCASE so it agrees with the lookup, which
+ * is also case-insensitive: an index with different collation than the query
+ * would be silently unused AND would not enforce the rule anybody relies on.
+ */
+function createNameUniqueIndex(handle: Database): void {
+  const create = () =>
+    handle.run(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_peers_name_unique
+         ON peers(name COLLATE NOCASE) WHERE name IS NOT NULL`
+    );
+  try {
+    create();
+  } catch {
+    // A database written before this index existed can already hold duplicates.
+    // Refusing to boot over old data would be worse than the duplicates are, so
+    // resolve them: the earliest registration keeps the name and the rest are
+    // un-named. They are still reachable by id, and a live session re-claims its
+    // name on its next set_name.
+    handle.run(`
+      UPDATE peers SET name = NULL
+      WHERE name IS NOT NULL
+        AND id NOT IN (
+          SELECT id FROM peers p2
+          WHERE p2.name IS NOT NULL
+            AND p2.registered_at = (
+              SELECT MIN(p3.registered_at) FROM peers p3
+              WHERE p3.name = p2.name COLLATE NOCASE
+            )
+          GROUP BY p2.name COLLATE NOCASE
+        )
+    `);
+    create();
+    console.error(
+      "[claude-peers broker] duplicate peer names found in an existing database; " +
+        "kept the earliest registration for each and cleared the rest. Affected sessions " +
+        "re-claim their name on their next set_name."
+    );
+  }
 }
 
 let db = openDatabase();
@@ -401,8 +465,8 @@ if (SSE_ENABLED && SSE_KEEPALIVE_MS > 0) {
 
 function prepareStatements() {
   const insertMessage = db.prepare(`
-    INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
-    VALUES (?, ?, ?, ?, 0)
+    INSERT INTO messages (from_id, to_id, text, sent_at, delivered, reply_to)
+    VALUES (?, ?, ?, ?, 0, ?)
   `);
 
   const deletePeer = db.prepare(`
@@ -427,6 +491,16 @@ function prepareStatements() {
       UPDATE peers SET summary = ? WHERE id = ?
     `),
 
+    updateName: db.prepare(`
+      UPDATE peers SET name = ? WHERE id = ?
+    `),
+
+    // Case-insensitive: "Zod" and "zod" are one handle. The exclusion arm lets a
+    // peer re-assert its own name without colliding with itself.
+    selectPeerByName: db.prepare(`
+      SELECT id, pid FROM peers WHERE name = ? COLLATE NOCASE AND id != ?
+    `),
+
     // Wrapped rather than exposed raw, so every caller that removes a peer also drops its streams.
     // A stream for an id the broker has forgotten can never carry anything again; left open it is
     // a descriptor and a controller held for nobody.
@@ -441,15 +515,15 @@ function prepareStatements() {
     // Never SELECT * here: the row carries the auth token, and these results are
     // serialised straight to any caller. Project the public columns only.
     selectAllPeers: db.prepare(`
-      SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen FROM peers
+      SELECT id, pid, cwd, git_root, tty, summary, name, registered_at, last_seen FROM peers
     `),
 
     selectPeersByDirectory: db.prepare(`
-      SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen FROM peers WHERE cwd = ?
+      SELECT id, pid, cwd, git_root, tty, summary, name, registered_at, last_seen FROM peers WHERE cwd = ?
     `),
 
     selectPeersByGitRoot: db.prepare(`
-      SELECT id, pid, cwd, git_root, tty, summary, registered_at, last_seen FROM peers WHERE git_root = ?
+      SELECT id, pid, cwd, git_root, tty, summary, name, registered_at, last_seen FROM peers WHERE git_root = ?
     `),
 
     // THE NOTIFICATION HOOK. Wrapping the statement rather than calling notifyMailbox from
@@ -460,8 +534,8 @@ function prepareStatements() {
     // Safe inside a transaction: the frame is enqueued into a stream the runtime flushes after the
     // current synchronous work, so the client's follow-up poll cannot run before the commit.
     insertMessage: {
-      run(fromId: string, toId: string, text: string, sentAt: string) {
-        const changes = insertMessage.run(fromId, toId, text, sentAt);
+      run(fromId: string, toId: string, text: string, sentAt: string, replyTo: string | null = null) {
+        const changes = insertMessage.run(fromId, toId, text, sentAt, replyTo);
         notifyMailbox(toId);
         return changes;
       },
@@ -539,6 +613,50 @@ function handleSetSummary(body: SetSummaryRequest): void {
 }
 
 /**
+ * A name is a routable address (send_message accepts it in place of an id), so
+ * it is validated like one: bounded, printable, and unique among registered
+ * peers. Uniqueness at SET time is what keeps resolution at SEND time
+ * unambiguous by construction; without it, every send would need a tiebreak.
+ */
+const NAME_RULE = /^[A-Za-z0-9][A-Za-z0-9 _-]{0,31}$/;
+
+function handleSetName(body: SetNameRequest): SetNameResponse {
+  const name = String(body.name ?? "").trim();
+  if (!NAME_RULE.test(name)) {
+    return { ok: false, error: "invalid: 1-32 chars, letters/digits/space/dash/underscore, must start alphanumeric" };
+  }
+  const holder = stmts.selectPeerByName.get(name, body.id) as { id: string; pid: number } | null;
+  if (holder) {
+    // A DEAD holder is not a holder. A session that restarts re-registers under a
+    // new id while its previous row survives until the next stale sweep, so
+    // without this a restarting session is refused its own name by its own
+    // corpse, for up to the sweep interval. That is precisely the window in
+    // which sessions restart, so it was the common case rather than the edge.
+    //
+    // Reap it here rather than waiting: cleanStalePeers would do exactly this,
+    // and doing it now keeps the name resolvable to the living peer immediately.
+    if (isProcessAlive(holder.pid)) {
+      return { ok: false, error: `taken ${holder.id}` };
+    }
+    stmts.deletePeer.run(holder.id);
+    noteDeletion(1);
+  }
+  try {
+    stmts.updateName.run(name, body.id);
+  } catch (e) {
+    // The unique index caught what the check above could not: another caller
+    // claimed this name between the read and the write. Impossible on today's
+    // single-threaded runtime, which is exactly why it must not be a 500 the
+    // day that changes. Same verdict a losing caller gets from the check.
+    if (/UNIQUE constraint failed/i.test(e instanceof Error ? e.message : String(e))) {
+      return { ok: false, error: "taken (lost a concurrent claim)" };
+    }
+    throw e;
+  }
+  return { ok: true };
+}
+
+/**
  * The peers a scope selects, minus the caller, minus anything whose process has died.
  *
  * Shared by /list-peers and /broadcast-message so a broadcast's audience is exactly the peers the
@@ -584,15 +702,39 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   return selectPeers(body);
 }
 
-function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
-  if (!target) {
-    return { ok: false, error: `Peer ${body.to_id} not found` };
+function handleSendMessage(body: SendMessageRequest): {
+  ok: boolean;
+  error?: string;
+  to_id?: string;
+} {
+  // to_id is an id first, a name second. Ids are 8 lowercase hex-ish chars and
+  // names must start alphanumeric with a 32-char cap, so a string can match
+  // both tables; the id lookup winning keeps old callers' behaviour exact.
+  let targetId = (
+    db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null
+  )?.id;
+  if (!targetId) {
+    targetId = (
+      db.query("SELECT id FROM peers WHERE name = ? COLLATE NOCASE").get(body.to_id) as {
+        id: string;
+      } | null
+    )?.id;
+  }
+  if (!targetId) {
+    return { ok: false, error: `Peer ${body.to_id} not found (no such id or name)` };
   }
 
-  stmts.insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
-  return { ok: true };
+  // Bounded and stringly: the token is minted by the asking client and echoed
+  // back verbatim; the broker only stores and returns it.
+  const replyTo =
+    typeof body.reply_to === "string" && body.reply_to.length > 0 && body.reply_to.length <= 64
+      ? body.reply_to
+      : null;
+  stmts.insertMessage.run(body.from_id, targetId, body.text, new Date().toISOString(), replyTo);
+  // The resolved id, not what the caller wrote: addressing by name must tell the
+  // caller WHICH peer it reached, which is what lets ask_peer bind its waiter to
+  // that peer instead of trusting any reply that quotes the token.
+  return { ok: true, to_id: targetId };
 }
 
 /**
@@ -667,6 +809,9 @@ function handleUnregister(body: { id: string }): void {
 const CALLER_FIELD: Record<string, string> = {
   "/heartbeat": "id",
   "/set-summary": "id",
+  // A name is an address: letting an unauthenticated caller rename a peer is
+  // letting them redirect that peer's inbound mail.
+  "/set-name": "id",
   "/list-peers": "exclude_id",
   "/send-message": "from_id",
   // Unauthenticated this would be the loudest route in the system: one call injecting a message
@@ -726,6 +871,8 @@ function dispatch(req: Request, path: string, body: unknown): Response {
     case "/set-summary":
       handleSetSummary(body as SetSummaryRequest);
       return Response.json({ ok: true });
+    case "/set-name":
+      return Response.json(handleSetName(body as SetNameRequest));
     case "/list-peers":
       return Response.json(handleListPeers(body as ListPeersRequest));
     case "/send-message":

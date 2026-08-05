@@ -106,6 +106,23 @@ function withCallerId(path: string, body: unknown): unknown {
 /** In-flight re-registration, so concurrent refusals share one attempt. */
 let reregistration: Promise<void> | null = null;
 
+/**
+ * Push the remembered name to the broker under the current identity.
+ *
+ * Throws on transport failure; resolves with the broker's verdict otherwise.
+ * A "taken" verdict is surfaced to the caller rather than retried: names are
+ * contended by design and the holder is not going to release it because we ask twice.
+ */
+async function applyName(): Promise<{ ok: boolean; error?: string }> {
+  const result = await brokerFetch<{ ok: boolean; error?: string }>("/set-name", {
+    id: myId,
+    name: myName,
+  });
+  if (result.ok) log(`Peer name claimed: ${myName}`);
+  else log(`Peer name not claimed (${result.error}); running unnamed`);
+  return result;
+}
+
 async function registerWithBroker(): Promise<RegisterResponse> {
   return brokerFetch<RegisterResponse>(
     "/register",
@@ -149,6 +166,12 @@ async function recoverIdentity(staleId: PeerId | null): Promise<void> {
       // The open stream is subscribed to an identity the broker has forgotten, so it can never
       // carry anything again. Dropping it makes the loop reconnect under the new one.
       restartStream();
+      // The broker's name column died with the old row (or the old database).
+      // Re-claim, best-effort: a collision here means another session took the
+      // name in the meantime, which set_name would have refused identically.
+      if (myName) {
+        applyName().catch(() => {});
+      }
       log(`Re-registered as peer ${myId} after the broker rejected the previous identity`);
     } finally {
       reregistration = null;
@@ -277,6 +300,22 @@ let myGitRoot: string | null = null;
 // nameless one: the broker's copy of both is lost with its database.
 let myTty: string | null = null;
 let mySummary = "";
+// The claimed peer name, remembered here so re-registration and broker-database
+// loss can re-claim it. Empty string means unnamed.
+let myName = (process.env.CLAUDE_PEERS_NAME ?? "").trim();
+
+// Blocking asks in flight, keyed by their correlation token. The delivery loop
+// resolves a waiter instead of rendering the reply as an inbound message.
+const pendingAsks = new Map<
+  string,
+  {
+    // The peer this ask was actually delivered to. A reply is only an answer if
+    // it comes from them: the token travels in a message body, so any peer that
+    // learns or guesses one could otherwise resolve somebody else's ask.
+    expect: string;
+    resolve: (reply: { text: string; from_id: string }) => void;
+  }
+>();
 
 // --- MCP Server ---
 
@@ -327,20 +366,55 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification.",
+      "Send a message to another Claude Code instance by peer ID or peer name. The message will be pushed into their session immediately via channel notification.",
     inputSchema: {
       type: "object" as const,
       properties: {
         to_id: {
           type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers)",
+          description:
+            'The peer ID or peer name of the target Claude Code instance (both shown by list_peers, e.g. "a1b2c3d4" or "zod")',
         },
         message: {
           type: "string" as const,
           description: "The message to send",
         },
+        in_reply_to: {
+          type: "string" as const,
+          description:
+            "When answering a blocking ask: the ask token quoted in that message (e.g. from " +
+            '"[Blocking ask #a1b2c3d4 ...]"). Routes your answer to the waiting session instead ' +
+            "of its normal inbox.",
+        },
       },
       required: ["to_id", "message"],
+    },
+  },
+  {
+    name: "ask_peer",
+    description:
+      "Ask another Claude Code instance a question and WAIT for its answer, up to a timeout. " +
+      "Blocking: use it when you need the answer to continue (a decision, a value, a confirmation), " +
+      "and send_message when you do not. The peer sees your question as a normal message with " +
+      "reply instructions embedded; if it does not answer in time you get a timeout notice and " +
+      "any late answer arrives as an ordinary message.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        to_id: {
+          type: "string" as const,
+          description: "The peer ID or peer name to ask (from list_peers)",
+        },
+        question: {
+          type: "string" as const,
+          description: "The question. Make it self-contained: the peer answers with only this text as context.",
+        },
+        timeout_seconds: {
+          type: "number" as const,
+          description: "How long to wait for the answer. Default 60, min 5, max 300.",
+        },
+      },
+      required: ["to_id", "question"],
     },
   },
   {
@@ -398,6 +472,34 @@ const TOOLS = [
       properties: {},
     },
   },
+  {
+    name: "set_name",
+    description:
+      "Claim a human-readable peer name for this session (e.g. the name your user calls you). " +
+      "Other sessions can then send_message to the name instead of the 8-char ID. Names are " +
+      "unique per broker: claiming one another live peer holds fails. Also settable at launch " +
+      "via the CLAUDE_PEERS_NAME environment variable.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        name: {
+          type: "string" as const,
+          description:
+            "1-32 chars, letters/digits/space/dash/underscore, starting alphanumeric. Case-insensitively unique.",
+        },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "whoami",
+    description:
+      "Report this session's own peer identity: ID, name (if any), working directory, git root, and current summary. Use it to tell a user or peer how this session can be addressed.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -437,6 +539,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
+          if (p.name) parts.push(`Name: ${p.name}`);
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
@@ -466,7 +569,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      const { to_id, message, in_reply_to } = args as {
+        to_id: string;
+        message: string;
+        in_reply_to?: string;
+      };
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -478,6 +585,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           from_id: myId,
           to_id,
           text: message,
+          ...(in_reply_to ? { reply_to: String(in_reply_to) } : {}),
         });
         if (!result.ok) {
           return {
@@ -494,6 +602,95 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               type: "text" as const,
               text: `Error sending message: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "ask_peer": {
+      const { to_id, question, timeout_seconds } = args as {
+        to_id: string;
+        question: string;
+        timeout_seconds?: number;
+      };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      const waitMs = Math.min(300, Math.max(5, Number(timeout_seconds) || 60)) * 1000;
+      // Client-minted correlation token: survives broker-database loss (a row id
+      // would not) and is a string end to end, so it can never poison channel meta.
+      const askId = Math.random().toString(36).slice(2, 10);
+      const replyAddress = myName || myId;
+
+      // The instructions ride in the TEXT, not in meta: the receiving model reads
+      // the text, and a peer running an older server still sees how to answer
+      // (its plain reply then arrives after our timeout as an ordinary message).
+      const framed =
+        `${question}\n\n` +
+        `[Blocking ask #${askId} — the sender is WAITING on this right now. Answer immediately ` +
+        `with the send_message tool: to_id="${replyAddress}", in_reply_to="${askId}", and put the ` +
+        `complete answer in message.]`;
+
+      try {
+        const sent = await brokerFetch<{ ok: boolean; error?: string; to_id?: string }>(
+          "/send-message",
+          { from_id: myId, to_id, text: framed }
+        );
+        if (!sent.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to ask: ${sent.error}` }],
+            isError: true,
+          };
+        }
+
+        const reply = await new Promise<{ text: string; from_id: string } | null>((resolve) => {
+          const timer = setTimeout(() => {
+            pendingAsks.delete(askId);
+            resolve(null);
+          }, waitMs);
+          pendingAsks.set(askId, {
+            // Resolved id when the broker reported one; otherwise what the caller
+            // typed, which is correct whenever it was already an id.
+            expect: sent.to_id ?? to_id,
+            resolve: (r) => {
+              clearTimeout(timer);
+              resolve(r);
+            },
+          });
+        });
+
+        if (reply === null) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `No answer from ${to_id} within ${waitMs / 1000}s (ask #${askId}). The question ` +
+                  `was still delivered; a late answer will arrive as an ordinary message.`,
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Answer from ${reply.from_id} (ask #${askId}):\n\n${reply.text}`,
+            },
+          ],
+        };
+      } catch (e) {
+        pendingAsks.delete(askId);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error asking peer: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
           isError: true,
@@ -580,6 +777,62 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
+    }
+
+    case "set_name": {
+      const { name: wanted } = args as { name: string };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/set-name", {
+          id: myId,
+          name: wanted,
+        });
+        if (!result.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Could not claim name: ${result.error}` }],
+            isError: true,
+          };
+        }
+        // Remembered so a later re-registration can re-claim it: the broker's
+        // copy dies with its database, same as the summary.
+        myName = wanted.trim();
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Name claimed: "${myName}". Peers can now send_message to it directly.`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error setting name: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "whoami": {
+      const parts = [
+        `ID: ${myId ?? "(not registered)"}`,
+        `Name: ${myName || "(none — claim one with set_name)"}`,
+        `CWD: ${myCwd}`,
+        `Repo: ${myGitRoot ?? "(none)"}`,
+        `Summary: ${mySummary || "(none)"}`,
+      ];
+      return {
+        content: [{ type: "text" as const, text: parts.join("\n") }],
+      };
     }
 
     case "check_messages": {
@@ -754,9 +1007,30 @@ async function pollAndPushMessages() {
     const fresh = result.messages.filter((m) => !pushedMessageIds.has(m.id));
 
     for (const msg of fresh) {
+      // A reply to a blocking ask is consumed by the waiter, never rendered as
+      // a second inbound message. Routing it HERE, in the one delivery path,
+      // is what makes double delivery impossible rather than merely unlikely:
+      // the stream and the poll both funnel into this loop, and a message is
+      // either a waiter's answer or an ordinary message, decided once.
+      if (msg.reply_to) {
+        const waiter = pendingAsks.get(msg.reply_to);
+        if (waiter && waiter.expect === msg.from_id) {
+          pendingAsks.delete(msg.reply_to);
+          pushedMessageIds.add(msg.id);
+          await ackMessages([msg.id]);
+          waiter.resolve({ text: msg.text, from_id: msg.from_id });
+          continue;
+        }
+        // Either no waiter (it timed out, or this session restarted), or a reply
+        // quoting the token from a peer we did not ask. Both fall through and
+        // deliver as an ordinary message rather than dropping it: an unexpected
+        // answer is still somebody talking to this session.
+      }
+
       // Look up the sender's info for context
       let fromSummary = "";
       let fromCwd = "";
+      let fromName = "";
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope: "machine",
@@ -768,19 +1042,26 @@ async function pollAndPushMessages() {
         if (sender) {
           fromSummary = sender.summary;
           fromCwd = sender.cwd;
+          fromName = sender.name ?? "";
         }
       } catch {
         // Non-critical, proceed without sender info
       }
 
       if (clientRendersChannel()) {
-        // Push as channel notification — this is what makes it immediate
+        // Push as channel notification — this is what makes it immediate.
+        //
+        // Every meta value MUST be a string: Claude Code Zod-validates channel
+        // notifications, and a non-string value does not merely drop the event,
+        // the handler error kills the whole stdio MCP connection (lesson
+        // imported from the synaq fork, learned there 2026-07-30).
         await mcp.notification({
           method: "notifications/claude/channel",
           params: {
             content: msg.text,
             meta: {
               from_id: msg.from_id,
+              from_name: fromName,
               from_summary: fromSummary,
               from_cwd: fromCwd,
               sent_at: msg.sent_at,
@@ -795,6 +1076,7 @@ async function pollAndPushMessages() {
         spoolMessage(sessionPid!, {
           id: msg.id,
           from_id: msg.from_id,
+          from_name: fromName,
           from_summary: fromSummary,
           from_cwd: fromCwd,
           sent_at: msg.sent_at,
@@ -1041,8 +1323,16 @@ async function main() {
     }
   })();
 
-  // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
+  // Deliberately NOT awaited.
+  //
+  // This used to race the summary against a 3000ms timer here, before the transport was connected,
+  // and it cost every session most of its startup: measured on dev at a median 2474ms to the
+  // initialize reply, of which 2001ms was this one network call. The wait bought nothing, because
+  // the late-apply below has always existed and covers the same ground. Registering first and
+  // filling the summary in afterwards takes the same session to 72ms.
+  //
+  // The peer is therefore visible to others for a second or two carrying no summary. That is the
+  // trade, and it is the cheap side of it.
 
   // 4. Register with broker
   const reg = await registerWithBroker();
@@ -1050,19 +1340,26 @@ async function main() {
   myToken = reg.token;
   log(`Registered as peer ${myId}`);
 
-  // If summary generation is still running, update it when done
-  if (!initialSummary) {
-    summaryPromise.then(async () => {
-      if (initialSummary && myId) {
-        try {
-          await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
-          log(`Late auto-summary applied: ${initialSummary}`);
-        } catch {
-          // Non-critical
-        }
-      }
-    });
+  // CLAUDE_PEERS_NAME: claim at startup, non-blocking and non-fatal. A "taken"
+  // verdict logs and runs unnamed rather than failing the session over a label.
+  if (myName) {
+    applyName().catch((e) =>
+      log(`Peer name claim failed (non-critical): ${e instanceof Error ? e.message : String(e)}`)
+    );
   }
+
+  // Apply the summary whenever it lands. Unconditional now: nothing above waits for it, so it is
+  // never already present at this point.
+  summaryPromise.then(async () => {
+    if (initialSummary && myId) {
+      try {
+        await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
+        log(`Late auto-summary applied: ${initialSummary}`);
+      } catch {
+        // Non-critical
+      }
+    }
+  });
 
   // 5. Connect MCP over stdio
   await mcp.connect(new StdioServerTransport());

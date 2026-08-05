@@ -63,11 +63,56 @@ The other Claude receives it immediately and responds.
 
 | Tool             | What it does                                                                   |
 | ---------------- | ------------------------------------------------------------------------------ |
-| `list_peers`     | Find other Claude Code instances, scoped to `machine`, `directory`, or `repo` |
-| `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)  |
+| `list_peers`     | Find other Claude Code instances, scoped to `machine`, `directory`, or `repo`  |
+| `send_message`   | Send a message to another instance by ID or name (arrives instantly via channel push) |
+| `ask_peer`       | Ask another instance a question and WAIT for its answer, up to a timeout (see below) |
 | `broadcast_message` | Send one message to every other instance in scope at once (see below)       |
 | `set_summary`    | Describe what you're working on (visible to other peers)                       |
+| `set_name`       | Claim a human-readable peer name, addressable by `send_message` (see below)    |
+| `whoami`         | Report this session's own ID, name, cwd, repo, and summary                     |
 | `check_messages` | Manually check for messages (fallback if not using channel mode)               |
+
+## Peer names
+
+A session can claim a name and be addressed by it, so "send this to zod" works without anyone
+copying 8-char IDs around:
+
+```
+User: your peer name is Zod
+Claude: [calls set_name("Zod")] Name claimed.
+
+# in any other session:
+Claude: [calls send_message(to_id: "zod", ...)]   # case-insensitive
+```
+
+- Claim at launch with `CLAUDE_PEERS_NAME=Zod` in the environment, or at any time with the
+  `set_name` tool.
+- Names are 1-32 chars (letters, digits, space, dash, underscore, starting alphanumeric) and
+  **unique per broker, case-insensitively**: claiming a name another live peer holds fails with
+  `taken <id>`. Uniqueness at claim time is what keeps send-time resolution unambiguous.
+- Renaming requires the peer's own bearer token: a name is a routable address, so an
+  unauthenticated rename would redirect that peer's inbound mail.
+- `list_peers` shows names; inbound pushes carry the sender's name in `meta.from_name`.
+- IDs keep working everywhere a name works. On a collision (`Peer x not found`, `taken ...`),
+  fall back to the ID from `list_peers`.
+
+## Asking and waiting: `ask_peer`
+
+`send_message` is fire-and-forget. `ask_peer(to_id, question, timeout_seconds?)` blocks until the
+peer answers or the timeout lapses (default 60s, 5-300):
+
+- The peer receives the question as a normal message with reply instructions embedded: it answers
+  with `send_message(..., in_reply_to: "<ask token>")`, and that answer resolves the waiting call.
+- The answer is consumed by the waiting `ask_peer` call and is **not** also delivered as a second
+  inbound message.
+- No answer in time returns a timeout notice; the question was still delivered, and a late answer
+  arrives as an ordinary message rather than vanishing.
+- **Only the peer you asked can answer.** The waiting call is bound to that peer, so a reply
+  quoting the token from anybody else is delivered as an ordinary message instead of resolving
+  your ask. The token travels inside a message body, so treating it alone as proof of identity
+  would trust every process that can see one.
+- Use `ask_peer` when the answer gates your next step (a decision, a value, a confirmation);
+  use `send_message` for everything else.
 
 ## Broadcasting
 
@@ -129,14 +174,9 @@ what the session did before. A broker that does not serve `/subscribe` at all, a
 started with `CLAUDE_PEERS_SSE=off`, is therefore not a broker a session goes deaf against, only a
 slower one.
 
-| Variable                       | Default | What it changes                                        |
-| ------------------------------ | ------- | ------------------------------------------------------ |
-| `CLAUDE_PEERS_SSE`             | `on`    | Broker: `off` makes `/subscribe` a 404                 |
-| `CLAUDE_PEERS_STREAM`          | `on`    | Server: `off` disables subscribing, polling only       |
-| `CLAUDE_PEERS_POLL_MS`         | `1000`  | Poll interval while there is no healthy stream         |
-| `CLAUDE_PEERS_POLL_IDLE_MS`    | `30000` | Poll interval while the stream is healthy              |
-| `CLAUDE_PEERS_SSE_KEEPALIVE_MS`| `25000` | Broker: comment frames down an idle stream             |
-| `CLAUDE_PEERS_STREAM_IDLE_MS`  | `75000` | Server: silence after which a stream is presumed dead  |
+Both halves of the transport are switchable, and the timings are tunable: see the delivery
+transport table under [Configuration](#configuration). Turning `CLAUDE_PEERS_SSE` off at the broker
+or `CLAUDE_PEERS_STREAM` off at a session is how the polling-only path is exercised deliberately.
 
 Measure it on your own machine with the harness, which runs unmodified against any checkout:
 
@@ -318,6 +358,29 @@ recipient never sees them. Anything already spooled to disk for a hook-delivered
 because that queue is a separate file. **Your peer id changes** when this happens, so an id another
 session noted earlier stops resolving; `list_peers` shows the new one.
 
+## Known limitation: a peer identity does not outlive its process
+
+Verified by chaos testing, 2026-08-05. **Peer identity is bound to the MCP server's process, not to
+your Claude Code session.** If that process dies and restarts, it registers as a NEW peer, and the
+old row is reaped by the stale-peer sweep along with any mail still queued for it.
+
+Measured: with 33 messages outstanding when the receiving process was `SIGKILL`ed, everything
+already handed over survived with zero duplicates, and everything still queued for the old id was
+destroyed. The sender was told `ok` at send time and is never told otherwise.
+
+What this means in practice:
+
+- A message is durable **once delivered**: acknowledgement happens after the receiving session has
+  been handed the message, so a crash in between costs a duplicate at worst, never a loss. Verified:
+  a broker `SIGKILL` mid-stream re-delivered 60 of 60 with zero duplicates.
+- Mail in flight to a session whose MCP server restarts is **not** durable.
+- Your **name** does survive a restart: a restarting session reclaims it from its own dead peer
+  rather than being refused by its own corpse.
+
+Fixing this properly means a session-stable identity rather than a process-bound one, which is a
+design change and not yet made here. Until then, treat `ask_peer` timeouts and unanswered messages
+around a restart as expected rather than as bugs.
+
 ## Updating and relaunching
 
 There is **no build step**. Bun runs the TypeScript directly, so "the latest code" just means the
@@ -396,22 +459,53 @@ You can also inspect and interact from the command line:
 cd ~/claude-peers-mcp
 
 bun cli.ts status            # broker status + all peers
-bun cli.ts peers             # list peers
-bun cli.ts send <id> <msg>   # send a message into a Claude session
+bun cli.ts peers             # list peers, showing "<id> (<name>)" for named ones
+bun cli.ts send <id> <msg>   # send a message into a Claude session (a peer NAME works too)
 bun cli.ts broadcast <msg>   # send a message into every Claude session on the machine
 bun cli.ts kill-broker       # stop the broker
 ```
 
 ## Configuration
 
-| Environment variable      | Default                  | Description                                            |
-| ------------------------- | ------------------------ | ------------------------------------------------------ |
-| `CLAUDE_PEERS_PORT`       | `7899`                   | Broker port                                            |
-| `CLAUDE_PEERS_DB`         | `~/.claude-peers.db`     | SQLite database path                                   |
-| `ANTHROPIC_API_KEY`       | Keychain OAuth token     | Auto-summary credential (optional)                     |
-| `CLAUDE_PEERS_CHANNEL`    | detected from parent     | `always` or `never`, overriding channel-push detection |
-| `CLAUDE_PEERS_SPOOL_DIR`  | `~/.claude-peers/inbox`  | Where queued messages are written for the hook         |
-| `CLAUDE_PEERS_SESSION_PID`| resolved from the tree   | Session identity escape hatch. Tests only: two sessions sharing a value share a queue |
+Every setting has a working default, so a fresh clone runs with no environment at all. These are
+the override points.
+
+**Identity and storage**
+
+| Environment variable      | Default                    | Description                                          |
+| ------------------------- | -------------------------- | ---------------------------------------------------- |
+| `CLAUDE_PEERS_PORT`       | `7899`                     | Broker port                                          |
+| `CLAUDE_PEERS_DB`         | `~/.claude-peers.db`       | SQLite database path                                 |
+| `CLAUDE_PEERS_NAME`       | unset                      | Claim this peer name at startup (see Peer names)     |
+| `CLAUDE_PEERS_SPOOL_DIR`  | `~/.claude-peers/inbox`    | Per-session queue for sessions without channel push  |
+| `ANTHROPIC_API_KEY`       | Keychain OAuth token       | Auto-summary credential (optional)                   |
+
+**Delivery transport**
+
+| Environment variable            | Default | Description                                                |
+| ------------------------------- | ------- | ---------------------------------------------------------- |
+| `CLAUDE_PEERS_SSE`              | `on`    | Broker: `off` makes `/subscribe` a 404                     |
+| `CLAUDE_PEERS_STREAM`           | `on`    | Server: `off` disables subscribing, polling only           |
+| `CLAUDE_PEERS_CHANNEL`          | detect  | `always` or `never` to override channel detection          |
+| `CLAUDE_PEERS_POLL_MS`          | `1000`  | Poll interval while there is no healthy stream             |
+| `CLAUDE_PEERS_POLL_IDLE_MS`     | `30000` | Poll interval while the stream is healthy                  |
+| `CLAUDE_PEERS_SSE_KEEPALIVE_MS` | `25000` | Broker: comment frames down an idle stream                 |
+| `CLAUDE_PEERS_STREAM_IDLE_MS`   | `75000` | Server: silence after which a stream is presumed dead      |
+| `CLAUDE_PEERS_STREAM_STABLE_MS` | `5000`  | How long a stream must hold before its backoff resets      |
+
+**Retention and backoff**
+
+| Environment variable               | Default   | Description                                              |
+| ---------------------------------- | --------- | -------------------------------------------------------- |
+| `CLAUDE_PEERS_MSG_TTL`             | `3600000` | Undelivered messages are swept after this many ms (1h)   |
+| `CLAUDE_PEERS_CHECKPOINT_MS`       | `1000`    | Debounce before the WAL is checkpointed after a delete   |
+| `CLAUDE_PEERS_POLL_BACKOFF_MAX_MS` | `60000`   | Ceiling on poll backoff while the broker is unreachable  |
+| `CLAUDE_PEERS_POLL_QUIET_MS`       | `300000`  | How often a sustained broker outage is re-reported       |
+
+**Test-only.** These exist so a test run cannot collide with a live session, and are not
+meant for normal use: `CLAUDE_PEERS_SESSION_PID` (pin the host session instead of walking the
+process tree), `CLAUDE_PEERS_TEST_PORT_MIN` / `CLAUDE_PEERS_TEST_PORT_MAX` (default `7810`-`7824`,
+the range suites draw ports from, deliberately excluding the live `7899`).
 
 
 ## Benchmarking delivery
@@ -441,7 +535,5 @@ Then exit and relaunch each Claude Code session
 
 - [Bun](https://bun.sh)
 - Claude Code v2.1.80+
-- claude.ai login (channels require it; API key auth will not work)
-
-- claude.ai login (channels require it :  API key auth won't work)
+- claude.ai login (channels require it; API key auth won't work)
 - Optional, for Codex peers: Codex CLI v0.145.0+ (`codex mcp add`)

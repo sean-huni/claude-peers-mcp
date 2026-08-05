@@ -33,6 +33,9 @@ import { join } from "node:path";
 export interface SpooledMessage {
   id: number;
   from_id: string;
+  // Sender's claimed peer name, empty when unnamed. Optional so spool files
+  // written by an older server still parse.
+  from_name?: string;
   from_summary: string;
   from_cwd: string;
   sent_at: string;

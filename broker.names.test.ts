@@ -247,6 +247,111 @@ test("reply_to is stored only when it is a bounded string", async () => {
   }
 });
 
+test("the schema itself enforces name uniqueness, not just the handler", async () => {
+  // handleSetName reads-then-writes, which is atomic only because Bun.serve runs
+  // one JS thread. That is a runtime property, not a declared invariant, so the
+  // rule is pinned in the schema where a future reusePort/worker/await cannot
+  // quietly repeal it. This test asserts the INDEX exists and bites, which the
+  // handler-level tests cannot distinguish from the handler merely being lucky.
+  const holder = await reg("/tmp/idx-holder");
+  expect((await post("/set-name", { id: holder.id, name: "indexed" }, holder.token)).body.ok).toBe(true);
+
+  const db = new Database(DB, { readonly: true });
+  const idx = db
+    .query("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_peers_name_unique'")
+    .get() as { sql: string } | null;
+  expect(idx, "the unique index must exist").not.toBeNull();
+  expect(idx!.sql).toContain("UNIQUE");
+  expect(idx!.sql).toContain("NOCASE");
+  db.close();
+
+  // Bypass the handler entirely and write a duplicate straight at the table.
+  // The constraint must refuse it; if it does not, the handler is the only guard.
+  const direct = new Database(DB);
+  const other = await reg("/tmp/idx-other");
+  let refused = false;
+  try {
+    direct.run("UPDATE peers SET name = ? WHERE id = ?", ["INDEXED", other.id]);
+  } catch (e) {
+    refused = /UNIQUE constraint failed/i.test(e instanceof Error ? e.message : String(e));
+  }
+  direct.close();
+  expect(refused, "a direct duplicate write must hit the unique constraint").toBe(true);
+});
+
+test("a legacy database holding duplicate names boots and keeps the earliest", async () => {
+  // Pre-index databases can already contain duplicates. Refusing to boot over old
+  // data would be worse than the duplicates, so the migration resolves them.
+  const dupDb = join(WORK, "dupes.db");
+  const seed = new Database(dupDb, { create: true });
+  seed.run(`
+    CREATE TABLE peers (
+      id TEXT PRIMARY KEY, pid INTEGER NOT NULL, cwd TEXT NOT NULL, git_root TEXT, tty TEXT,
+      summary TEXT NOT NULL DEFAULT '', name TEXT, registered_at TEXT NOT NULL,
+      last_seen TEXT NOT NULL, token TEXT
+    )
+  `);
+  seed.run(`
+    CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+      text TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, reply_to TEXT
+    )
+  `);
+  // Real live pids: the broker reaps rows whose process is dead at boot, which
+  // would delete these rows for a reason that has nothing to do with the index
+  // and leave the test unable to tell the two explanations apart.
+  const spawnAlive = () =>
+    trackProcess(Bun.spawn(["sleep", "300"], { stdout: "ignore", stderr: "ignore" }));
+  const aliveA = spawnAlive();
+  const aliveB = spawnAlive();
+  const aliveC = spawnAlive();
+  held.push(aliveA, aliveB, aliveC);
+  const ins = seed.prepare(
+    "INSERT INTO peers (id,pid,cwd,summary,name,registered_at,last_seen,token) VALUES (?,?,?,'',?,?,?,'t')"
+  );
+  ins.run("aaaaaaaa", aliveA.pid, "/tmp/dup-a", "twin", "2020-01-01T00:00:00.000Z", "2020-01-01T00:00:00.000Z");
+  ins.run("bbbbbbbb", aliveB.pid, "/tmp/dup-b", "TWIN", "2021-01-01T00:00:00.000Z", "2021-01-01T00:00:00.000Z");
+  ins.run("cccccccc", aliveC.pid, "/tmp/dup-c", "solo", "2021-01-01T00:00:00.000Z", "2021-01-01T00:00:00.000Z");
+  seed.close();
+
+  const port2 = reserveFreePort();
+  trackProcess(
+    Bun.spawn(["bun", `${import.meta.dir}/broker.ts`], {
+      env: { ...ENV, CLAUDE_PEERS_PORT: String(port2), CLAUDE_PEERS_DB: dupDb },
+      stdout: "ignore",
+      stderr: "ignore",
+    })
+  );
+  try {
+    let up = false;
+    for (let i = 0; i < 40 && !up; i++) {
+      await Bun.sleep(100);
+      up = await fetch(`http://127.0.0.1:${port2}/health`).then((r) => r.ok).catch(() => false);
+    }
+    expect(up, "the broker must boot over a database with duplicate names").toBe(true);
+
+    const after = new Database(dupDb, { readonly: true });
+    const rows = after.query("SELECT id, name FROM peers ORDER BY id").all() as {
+      id: string;
+      name: string | null;
+    }[];
+    after.close();
+    // Earliest registration keeps it; the later twin is cleared; unrelated name untouched.
+    const byId = (id: string) => {
+      const row = rows.find((r) => r.id === id);
+      // A missing row is a DIFFERENT failure from a wrong name (the stale-peer
+      // sweep reaping it), so say which one happened rather than dereferencing.
+      expect(row, `peer ${id} should still exist after the migration`).toBeDefined();
+      return row!;
+    };
+    expect(byId("aaaaaaaa").name).toBe("twin");
+    expect(byId("bbbbbbbb").name).toBeNull();
+    expect(byId("cccccccc").name).toBe("solo");
+  } finally {
+    sweepBrokerOnPort(port2);
+  }
+});
+
 test("a legacy database without the name column is migrated at boot", async () => {
   // Build a pre-names schema file, then point a fresh broker at it.
   const legacyDb = join(WORK, "legacy.db");

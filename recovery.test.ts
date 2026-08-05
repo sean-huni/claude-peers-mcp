@@ -15,15 +15,18 @@
 
 import { test, expect, afterAll } from "bun:test";
 import { existsSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
+import { reserveFreePort } from "./testsupport";
 
-// This range is reserved for this suite. 7899 is the user's live broker and is
-// never touched here.
+// Reserved from the shared pool rather than hardcoded. A hardcoded range silently
+// becomes a collision the moment the pool is widened over it, which is exactly what
+// happened on 2026-08-05: the pool grew to 7830-7889 and swallowed three suites'
+// private ranges, and the failures looked like flakes.
 const PORTS = {
-  brokerLoss: 7831,
-  tokenAfterLoss: 7833,
-  sessionReset: 7835,
-  singleFlight: 7837,
-  boundedRetry: 7839,
+  brokerLoss: reserveFreePort(),
+  tokenAfterLoss: reserveFreePort(),
+  sessionReset: reserveFreePort(),
+  singleFlight: reserveFreePort(),
+  boundedRetry: reserveFreePort(),
 };
 
 const spawned: ReturnType<typeof Bun.spawn>[] = [];
